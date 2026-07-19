@@ -1,0 +1,35 @@
+# Yellowstone Cache — AUTO režim (opciono).
+#
+# Boot korak je `repair --apply` — idempotentan:
+#   - nema registrovanih keševa      -> ne radi ništa
+#   - keš registrovan, RAM nestao    -> sastavi iznova (recreate)
+#   - prekinuta up/down procedura    -> razreši po docs/state.md
+# Ista logika koju bi admin kucao ručno — samo automatski.
+#
+# NAMERNO nema ExecStop: svako gašenje se tretira kao pad
+# (nestanak struje ionako ne izvršava stop), pa je put dizanja
+# UVEK isti. down se radi isključivo ručno, kad se keš namerno skida.
+#
+# Instalacija:
+#   cp yellowstone.service /etc/systemd/system/
+#   mkdir -p /etc/systemd/system/target.service.d
+#   cp target.service.d-yellowstone.conf \
+#      /etc/systemd/system/target.service.d/yellowstone.conf
+#   systemctl daemon-reload
+#   systemctl enable yellowstone target
+#
+# Bezbedno jer je RAM keš writethrough — posle bilo kakvog pada
+# keš se samo puni ispočetka, podaci su na RAID-u.
+
+[Unit]
+Description=Yellowstone Cache (assemble cache before LIO)
+Before=target.service
+Wants=target.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/yellowstone/bin/yellowstone repair --apply
+
+[Install]
+WantedBy=multi-user.target

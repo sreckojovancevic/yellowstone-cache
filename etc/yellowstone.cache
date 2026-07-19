@@ -1,0 +1,34 @@
+# Yellowstone Cache konfiguracija
+
+[cache]
+# Globalni prekidac
+enable = true
+
+# Cache engine (lib/cache/<engine>.py)
+engine = dmsetup
+
+# Tip cache uredjaja:
+#   ram    - RAM disk (brd modul), iskljucivo writethrough
+#   device - postojeci block uredjaj (NVMe/SSD)
+cache_type = ram
+
+# Velicina RAM cache-a (cache_type = ram)
+cache_ram = 12G
+
+# Rezervisi svih cache_ram odmah pri up-u (dodir svake stranice).
+# true  = memorija zauzeta unapred, vidljiva u htop odmah, bez rizika
+#         kasnijeg OOM-a kad se kes zagreje (preporuceno)
+# false = lenja alokacija (brd default), memorija raste sa punjenjem
+ram_prealloc = true
+
+# Minimum slobodne memorije koja mora ostati sistemu POSLE
+# zauzimanja RAM cache-a
+memory_headroom = 4G
+
+# Block uredjaj za cache (cache_type = device)
+cache_device =
+
+# writethrough | writeback
+# NAPOMENA: ram + writeback je zabranjena kombinacija (gubitak
+# podataka pri nestanku struje) i alat je odbija.
+cache_mode = writethrough

@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+
+"""
+Yellowstone Cache — CLI
+
+Komande:
+    yellowstone validate            [--json]
+    yellowstone up NAME             [--json]   # zakači cache (NAME = LIO backstore)
+    yellowstone down NAME           [--json]   # otkači cache, LIO nazad na origin
+    yellowstone status NAME         [--json]
+    yellowstone list                [--json]
+    yellowstone version
+
+Exit code procesa = status kod operacije.
+Administrativne komande zahtevaju root.
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Jedino mesto gde se podešava sys.path — svi moduli koriste "lib." importe.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib import cachectl
+from lib import output
+from lib import repair as repairmod
+from lib import state
+from lib import status
+from lib.version import NAME, VERSION
+
+ROOT_COMMANDS = {"up", "down", "repair"}
+
+
+def cmd_validate(args):
+    result = cachectl.validate()
+
+    if args.json:
+        output.emit_json(result)
+    else:
+        output.print_validation(result)
+
+    return result["code"]
+
+
+def cmd_up(args):
+    return _simple(cachectl.up(args.name), args)
+
+
+def cmd_down(args):
+    return _simple(cachectl.down(args.name), args)
+
+
+def cmd_status(args):
+    result = cachectl.cache_status(args.name)
+
+    if args.json:
+        output.emit_json(result)
+    elif result["code"] == status.STATUS_OK:
+        output.print_status(args.name, result["info"], result["stats"])
+    else:
+        output.error(result["message"])
+
+    return result["code"]
+
+
+def cmd_list(args):
+    caches = state.list_all()
+
+    if args.json:
+        output.emit_json(caches)
+        return status.STATUS_OK
+
+    output.header()
+    output.section("Registered caches")
+    print()
+
+    if not caches:
+        output.warning("No caches registered.")
+    else:
+        for name, info in caches.items():
+            output.line("Name", name)
+            output.line("Phase", info.get("phase", "?"))
+            output.line("Origin", info["origin"])
+            output.line("Cache type", info.get("cache_type", "?"))
+            output.line("Cache device", info["cache_device"])
+            output.line("Mode", info["mode"])
+            output.line("DM device", f'/dev/mapper/{info["dm_name"]}')
+            print()
+
+        for name, info in state.incomplete().items():
+            output.warning(
+                f"'{name}' has interrupted procedure "
+                f"(phase={info.get('phase')}) — see docs/state.md.")
+
+    return status.STATUS_OK
+
+
+def cmd_repair(args):
+    if args.name:
+        results = [repairmod.repair(args.name, apply=args.apply)]
+    else:
+        results = repairmod.repair_all(apply=args.apply)
+
+    if args.json:
+        output.emit_json(results)
+        return max((r["code"] for r in results), default=status.STATUS_OK)
+
+    output.header()
+    mode = "EXECUTED" if args.apply else "PLAN (dry-run, use --apply)"
+    output.section(f"Repair — {mode}")
+    print()
+
+    if not results:
+        output.warning("No registered caches — nothing to repair.")
+        return status.STATUS_OK
+
+    worst = status.STATUS_OK
+
+    for r in results:
+        output.line("Name", r["name"])
+        output.line("Action", r.get("action") or "-")
+        if r.get("detail"):
+            output.line("State", r["detail"])
+        if r["code"] == status.STATUS_OK:
+            output.success(r["message"])
+        else:
+            output.error(r["message"])
+            worst = r["code"]
+        print()
+
+    return worst
+
+
+def cmd_version(args):
+    print(f"{NAME} {VERSION}")
+    return status.STATUS_OK
+
+
+def _simple(result, args):
+    if args.json:
+        output.emit_json(result)
+    elif result["code"] == status.STATUS_OK:
+        output.success(result["message"])
+    else:
+        output.error(result["message"])
+
+    return result["code"]
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="yellowstone", description=NAME)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add(name, func, *positional):
+        p = sub.add_parser(name)
+        for arg in positional:
+            p.add_argument(arg)
+        p.add_argument("--json", action="store_true",
+                       help="JSON izlaz za automatizaciju")
+        p.set_defaults(func=func)
+
+    add("validate", cmd_validate)
+    add("up", cmd_up, "name")
+    add("down", cmd_down, "name")
+    add("status", cmd_status, "name")
+    add("list", cmd_list)
+    add("version", cmd_version)
+
+    p_repair = sub.add_parser("repair")
+    p_repair.add_argument("name", nargs="?", default=None)
+    p_repair.add_argument("--apply", action="store_true",
+                          help="izvrši plan (bez ovoga: samo prikaz)")
+    p_repair.add_argument("--json", action="store_true")
+    p_repair.set_defaults(func=cmd_repair)
+
+    args = parser.parse_args()
+
+    if args.command in ROOT_COMMANDS and os.geteuid() != 0:
+        output.error(f"'{args.command}' requires root.")
+        sys.exit(status.STATUS_INTERNAL_ERROR)
+
+    try:
+        sys.exit(args.func(args))
+    except Exception as e:  # poslednja linija odbrane
+        output.error(f"Internal error: {e}")
+        sys.exit(status.STATUS_INTERNAL_ERROR)
+
+
+if __name__ == "__main__":
+    main()

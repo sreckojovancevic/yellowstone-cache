@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Yellowstone Cache state file (state/caches.json)",
+  "type": "object",
+  "required": ["version", "caches"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Verzija formata state fajla."
+    },
+    "caches": {
+      "type": "object",
+      "description": "Zapisi po imenu LIO backstore-a.",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "phase", "origin", "origin_at_attach",
+          "cache_type", "cache_device", "mode", "dm_name"
+        ],
+        "properties": {
+          "phase": {
+            "enum": ["attaching", "active", "detaching"],
+            "description": "Faza zivotnog ciklusa; != active znaci prekinutu proceduru."
+          },
+          "origin": {
+            "type": "string",
+            "description": "Stabilna by-id putanja origin uredjaja."
+          },
+          "origin_at_attach": {
+            "type": "string",
+            "description": "Putanja iz saveconfig.json u trenutku attach-a."
+          },
+          "cache_type": {
+            "enum": ["ram", "device"]
+          },
+          "cache_device": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": ["writethrough", "writeback"]
+          },
+          "dm_name": {
+            "type": "string",
+            "description": "Ime dm cache targeta (pomocni: <dm_name>-cmeta/-cdata)."
+          },
+          "backup": {
+            "type": "string",
+            "description": "Backup saveconfig.json iz ove procedure."
+          }
+        }
+      }
+    }
+  }
+}
