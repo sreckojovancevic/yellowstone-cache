@@ -179,6 +179,4 @@ state/, logs/            runtime (not part of the repo)
 - Monitor mode (migration threshold tuning under array pressure)
 
 ## License
-
-To be decided before first public release (GPL-2.0 under
-consideration — same ecosystem as the kernel and device-mapper).
+GPL-2.0 — see [LICENSE](LICENSE).
