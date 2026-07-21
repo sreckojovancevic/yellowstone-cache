@@ -9,7 +9,8 @@ export. The initiator (VMware ESXi, Windows, Linux) sees the exact same
 disk before and after — same WWN/NAA ID, same LUN number, same ACLs,
 same size. The only thing that changes is speed.
 
-> **Status: alpha.** Tested on one production-like system (see field
+> **Status: alpha.** Tested on one production-like system at [SKGO Standing
+> conference of towns and municipalities] (https://www.skgo.org) (see field
 > test below). Writethrough only for RAM caches — enforced in code.
 > Use at your own risk, read the safety section first.
 
