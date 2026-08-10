@@ -9,9 +9,12 @@ export. The initiator (VMware ESXi, Windows, Linux) sees the exact same
 disk before and after — same WWN/NAA ID, same LUN number, same ACLs,
 same size. The only thing that changes is speed.
 
-> **Status: alpha.** Tested on one production-like system (see field
-> test below). Writethrough only for RAM caches — enforced in code.
-> Use at your own risk, read the safety section first.
+> **Status: alpha.** Running in production on one system since
+> 2026-07-19: it has survived a datacenter blackout, an unexplained
+> host reset and a full array rebuild, each recovered with a single
+> command (see [field tests](docs/field-test.md)). Writethrough only
+> for RAM caches — enforced in code. Use at your own risk, and read
+> the safety section first.
 
 ## The key idea
 
@@ -46,13 +49,15 @@ LIO in the exact state it would be in if Yellowstone had never existed.
                                     (RAM cache)    (origin - untouched)
 ```
 
-## Field test results (v0.3.5-alpha)
+## Field test results
 
-Test rig: Dell PowerEdge R510 (24 threads, 62 GiB RAM), PERC H700,
-2-disk RAID 0 volume (temporary), QLogic FC target to VMware ESXi 7.0.
-Cache: 12 GiB RAM (brd), writethrough, preallocated.
-Workload: Windows NVR VM boot + 1 GiB file copy, Alpine VM with
-containers (PHP + MySQL site).
+Not a lab: a live Dell PowerEdge R510 (24 threads, 62 GiB RAM, PERC
+H700) exporting over QLogic Fibre Channel to VMware ESXi 7.0, carrying
+production VMs. Cache: RAM (brd), writethrough, preallocated.
+
+The numbers below span several weeks and two arrays. Full method and
+raw data: [docs/field-test.md](docs/field-test.md) ·
+[docs/benchmark-protocol.md](docs/benchmark-protocol.md)
 
 | Metric | Result |
 |--------|--------|
@@ -212,5 +217,4 @@ state/, logs/            runtime (not part of the repo)
 
 ## License
 
-To be decided before first public release (GPL-2.0 under
-consideration — same ecosystem as the kernel and device-mapper).
+GPL 2.0
