@@ -153,8 +153,20 @@ sudo /opt/yellowstone/bin/yellowstone status <BACKSTORE_NAME>
 
 Before `up`/`down` on a live ESXi environment: power off / unregister
 VMs and unmount the datastore first — LIO teardown can hang on
-in-flight FC/iSCSI commands if an initiator is actively using the LUN
-(see `docs/uputstvo.md` for the full procedure and troubleshooting).
+in-flight FC/iSCSI commands if an initiator is actively using the LUN.
+Since v0.4.0 a preflight check refuses the operation instead of hanging
+the kernel; `--force` overrides it if you know better.
+
+To resize or refresh an existing cache, use **`reset`** rather than
+`down` followed by `up`: the latter leaves a window in which initiators
+reconnect, and the second teardown is the one that hangs.
+
+```bash
+vi /opt/yellowstone/etc/yellowstone.cache     # cache_ram = 24G
+sudo /opt/yellowstone/bin/yellowstone reset <BACKSTORE_NAME>
+```
+
+Full procedure and troubleshooting: `docs/uputstvo.md`.
 
 ## Reboot behaviour
 
@@ -186,10 +198,22 @@ an LVM logical volume. Existing production LUNs usually aren't.
 only in the cache until flushed. RAM + power loss = silent data loss
 for every initiator. This is not a tunable.
 
-**Does the sequential workload pollute the cache?** No — the smq
-policy deliberately bypasses sequential I/O (large copies, NVR/video
-streams go straight to the array). Confirmed in the field test: a
-sustained sequential copy promoted almost nothing.
+**Does sequential I/O pollute the cache?** Partly — and the honest
+answer is more useful than the marketing one. The `smq` policy does
+bypass detectably-sequential *reads*: a single large file copy in the
+first field test promoted almost nothing. But two real workloads defeat
+that in practice:
+
+- **Multi-stream video.** An NVR writing and reading a dozen camera
+  streams at once produces I/O that is sequential per stream but
+  interleaved at the block layer — the detector sees random access and
+  promotes it. Video is the worst possible cache tenant (huge volume,
+  zero reuse), so give it its own uncached LUN.
+- **Sequential writes in writethrough mode.** A 64 GiB sequential
+  preparation write filled the cache to 99.7 %. Bypass of sequential
+  *reads* does not imply bypass of sequential *writes*.
+
+Both were measured, not assumed — see Field Tests #3 and #5.
 
 **What does the initiator see during `up`/`down`?** A short I/O stall
 (ESXi: APD) for the duration of the downtime window — seconds. VMs do
@@ -217,4 +241,5 @@ state/, logs/            runtime (not part of the repo)
 
 ## License
 
-GPL 2.0
+To be decided before first public release (GPL-2.0 under
+consideration — same ecosystem as the kernel and device-mapper).
