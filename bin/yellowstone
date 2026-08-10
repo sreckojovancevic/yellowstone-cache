@@ -4,15 +4,21 @@
 Yellowstone Cache — CLI
 
 Komande:
-    yellowstone validate            [--json]
-    yellowstone up NAME             [--json]   # zakači cache (NAME = LIO backstore)
-    yellowstone down NAME           [--json]   # otkači cache, LIO nazad na origin
-    yellowstone status NAME         [--json]
-    yellowstone list                [--json]
+    yellowstone validate                 [--json]
+    yellowstone up NAME       [--force]  [--json]  # zakači cache
+    yellowstone down NAME     [--force]  [--json]  # otkači cache
+    yellowstone reset NAME    [--force]  [--json]  # ponovo napravi keš,
+                                                   # jedan LIO ciklus
+    yellowstone status NAME   [--delta N] [--json]
+    yellowstone list                     [--json]
+    yellowstone repair [NAME] [--apply] [--no-start] [--json]
     yellowstone version
 
 Exit code procesa = status kod operacije.
 Administrativne komande zahtevaju root.
+
+--force preskače preflight proveru zauzetosti uređaja (koristi samo ako
+znaš da initiatori ne diraju LUN — inače teardown ume da visi u D stanju).
 """
 
 import argparse
@@ -30,7 +36,7 @@ from lib import state
 from lib import status
 from lib.version import NAME, VERSION
 
-ROOT_COMMANDS = {"up", "down", "repair"}
+ROOT_COMMANDS = {"up", "down", "reset", "repair"}
 
 
 def cmd_validate(args):
@@ -45,14 +51,30 @@ def cmd_validate(args):
 
 
 def cmd_up(args):
-    return _simple(cachectl.up(args.name), args)
+    return _simple(cachectl.up(args.name, force=args.force), args)
 
 
 def cmd_down(args):
-    return _simple(cachectl.down(args.name), args)
+    return _simple(cachectl.down(args.name, force=args.force), args)
+
+
+def cmd_reset(args):
+    return _simple(cachectl.reset(args.name, force=args.force), args)
 
 
 def cmd_status(args):
+    if args.delta:
+        result = cachectl.status_delta(args.name, args.delta)
+
+        if args.json:
+            output.emit_json(result)
+        elif result["code"] == status.STATUS_OK:
+            output.print_delta(args.name, result)
+        else:
+            output.error(result["message"])
+
+        return result["code"]
+
     result = cachectl.cache_status(args.name)
 
     if args.json:
@@ -99,9 +121,11 @@ def cmd_list(args):
 
 def cmd_repair(args):
     if args.name:
-        results = [repairmod.repair(args.name, apply=args.apply)]
+        results = [repairmod.repair(args.name, apply=args.apply,
+                                    no_start=args.no_start)]
     else:
-        results = repairmod.repair_all(apply=args.apply)
+        results = repairmod.repair_all(apply=args.apply,
+                                       no_start=args.no_start)
 
     if args.json:
         output.emit_json(results)
@@ -153,27 +177,40 @@ def main():
     parser = argparse.ArgumentParser(prog="yellowstone", description=NAME)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add(name, func, *positional):
+    def add(name, func, *positional, force=False):
         p = sub.add_parser(name)
         for arg in positional:
             p.add_argument(arg)
+        if force:
+            p.add_argument("--force", action="store_true",
+                           help="preskoči preflight proveru zauzetosti")
         p.add_argument("--json", action="store_true",
                        help="JSON izlaz za automatizaciju")
-        p.set_defaults(func=func)
+        p.set_defaults(func=func, force=False)
+        return p
 
     add("validate", cmd_validate)
-    add("up", cmd_up, "name")
-    add("down", cmd_down, "name")
-    add("status", cmd_status, "name")
+    add("up", cmd_up, "name", force=True)
+    add("down", cmd_down, "name", force=True)
+    add("reset", cmd_reset, "name", force=True)
     add("list", cmd_list)
     add("version", cmd_version)
+
+    p_status = add("status", cmd_status, "name")
+    p_status.add_argument("--delta", type=int, metavar="SECONDS",
+                          help="izmeri stope u intervalu umesto "
+                               "kumulativnih brojača")
 
     p_repair = sub.add_parser("repair")
     p_repair.add_argument("name", nargs="?", default=None)
     p_repair.add_argument("--apply", action="store_true",
                           help="izvrši plan (bez ovoga: samo prikaz)")
+    p_repair.add_argument("--no-start", action="store_true",
+                          dest="no_start",
+                          help="ne diži LIO na kraju (kad odmah sledi "
+                               "druga operacija)")
     p_repair.add_argument("--json", action="store_true")
-    p_repair.set_defaults(func=cmd_repair)
+    p_repair.set_defaults(func=cmd_repair, force=False)
 
     args = parser.parse_args()
 

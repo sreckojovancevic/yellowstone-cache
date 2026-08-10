@@ -90,6 +90,8 @@ Exit code procesa = status kod operacije (0 = OK).
 | `yellowstone up NAME`        | Zakači cache na backstore NAME               | da   |
 | `yellowstone down NAME`      | Otkači cache, vrati LIO na origin            | da   |
 | `yellowstone status NAME`    | Status + statistika keša (hit ratio, dirty…) | ne   |
+| `yellowstone reset NAME`     | Ponovo napravi keš u jednom LIO ciklusu      | da   |
+| `yellowstone status NAME --delta 15` | Stope u intervalu (ne kumulativno)   | ne   |
 | `yellowstone list`           | Svi registrovani keševi i njihove faze       | ne   |
 | `yellowstone repair [NAME]`  | Plan oporavka prekinutih procedura (dry-run) | da   |
 | `yellowstone repair --apply` | Izvrši plan oporavka                         | da   |
@@ -198,6 +200,43 @@ state/backups/            — backup saveconfig.json pre svake izmene
 
 * Jedan RAM cache po serveru (`/dev/ram0` fiksno)
 * bcache/lvmcache engine-i su predviđeni interfejsom, nisu implementirani
+
+## Promena veličine keša — koristi `reset`, ne `down` + `up`
+
+Kad menjaš `cache_ram` (ili hoćeš svež, hladan keš), **nemoj raditi
+`down` pa `up`**. Razlog: `down` na kraju diže LIO, initiatori se za
+par sekundi ponovo zakače na LUN, i onda `up` mora **opet** da gasi
+LIO — a taj drugi teardown ume da zaglavi u D stanju i jedini izlaz je
+reboot servera.
+
+```bash
+vi /opt/yellowstone/etc/yellowstone.cache      # cache_ram = 24G
+sudo /opt/yellowstone/bin/yellowstone reset TestDisk
+```
+
+`reset` uradi sve — skine stari sloj, napravi novi ramdisk po novoj
+veličini, sastavi dm-cache i vrati LIO — **između jednog `lio_stop` i
+jednog `lio_start`**. Nema prozora u kom se initiator zakači.
+
+## Merenje: `--delta` umesto kumulativnih brojača
+
+`status` bez argumenata prikazuje brojače od trenutka kad je keš
+napravljen. Posle nekoliko dana oni mešaju sve što se ikad desilo
+(migracije, backup prolaze, mirne noći) i ne opisuju nijedno stvarno
+stanje.
+
+```bash
+sudo /opt/yellowstone/bin/yellowstone status TestDisk --delta 15
+```
+
+Uzme dva uzorka u razmaku od 15 sekundi i prikaže **stope**: IOPS,
+hit ratio za taj interval, brzinu promocija u MB/s i **vreme punog
+obrta keša**. Ako je obrt ispod 15 minuta, alat upozorava — to znači
+da radni skup daleko prevazilazi keš i da blok ne stigne da se
+iskoristi pre nego što izleti.
+
+Koristi ovo i pri benchmarkovanju — uzmi `--delta` tokom svakog fio
+prolaza umesto ručnog oduzimanja JSON-a.
 
 ## Repair — kada i kako se koristi
 

@@ -25,6 +25,7 @@ from lib import state
 from lib import shell
 from lib import lio
 from lib import sysinfo
+from lib import preflight
 from lib import stats as statsmod
 from lib import logger
 from lib.config import load_config, ConfigError
@@ -40,7 +41,7 @@ def _err(code, message):
     return {"code": code, "message": message}
 
 
-def up(name):
+def up(name, force=False):
     """
     Zakači cache na LIO backstore `name` (ime iz saveconfig.json).
     """
@@ -93,6 +94,13 @@ def up(name):
                 f"(cache + headroom), available {available // 1024**2} MB.")
 
     dm_name = f"{name}Cached"
+
+    # Preflight: da li neki initiator aktivno koristi LUN?
+    # (gašenje LIO-a nad zauzetim uređajem visi u D stanju)
+    if not force:
+        ok, message = preflight.check_idle(origin)
+        if not ok:
+            return _err(status.STATUS_LIO_ERROR, message)
 
     # ---- Od ove tačke LIO ide dole: sve mora imati rollback ----
 
@@ -184,7 +192,7 @@ def up(name):
     }
 
 
-def down(name):
+def down(name, force=False):
     """
     Otkači cache sa backstore-a `name` i vrati LIO na origin.
     """
@@ -199,6 +207,11 @@ def down(name):
     if not info:
         return _err(status.STATUS_CACHE_MISSING,
                     f"Cache for '{name}' is not registered.")
+
+    if not force:
+        ok, message = preflight.check_idle(f'/dev/mapper/{info["dm_name"]}')
+        if not ok:
+            return _err(status.STATUS_LIO_ERROR, message)
 
     t0 = time.monotonic()
 
@@ -254,6 +267,131 @@ def down(name):
     }
 
 
+def reset(name, force=False):
+    """
+    Ponovo napravi keš u JEDNOM LIO ciklusu.
+
+    Motiv iz prakse: `down` na kraju diže LIO, initiatori se za par
+    sekundi ponovo zakače, pa `up` mora opet da ga gasi — i taj drugi
+    teardown visi u D stanju. `reset` radi sve između jednog
+    lio_stop i jednog lio_start, pa tog prozora nema.
+
+    Koristi se za: promenu veličine keša, osvežavanje hladnim kešom,
+    prelazak na drugi cache uređaj — sve bez izlaganja LIO-a dvaput.
+    """
+
+    try:
+        engine, config = _engine_and_config()
+    except ConfigError as e:
+        return _err(status.STATUS_CONFIG_ERROR, str(e))
+
+    cfg = config["cache"]
+
+    info = state.get(name)
+
+    if not info:
+        return _err(status.STATUS_CACHE_MISSING,
+                    f"Cache for '{name}' is not registered — use 'up'.")
+
+    origin = info["origin"]
+    dm_name = info["dm_name"]
+
+    if cfg["cache_type"] == "ram":
+        ok, available, needed = sysinfo.check_memory(
+            cfg["cache_ram"], cfg["memory_headroom"])
+
+        if not ok:
+            return _err(
+                status.STATUS_CONFIG_ERROR,
+                f"Not enough memory: need {needed // 1024**2} MB "
+                f"(cache + headroom), available {available // 1024**2} MB.")
+
+    if not force:
+        ok, message = preflight.check_idle(f"/dev/mapper/{dm_name}")
+        if not ok:
+            return _err(status.STATUS_LIO_ERROR, message)
+
+    t0 = time.monotonic()
+
+    # --- jedini lio_stop ---
+    stopped = shell.run("lio_stop.sh")
+
+    if stopped["code"] != status.STATUS_OK:
+        return _err(status.STATUS_LIO_ERROR,
+                    stopped["stderr"] or "Failed to stop LIO.")
+
+    state.set_phase(name, state.PHASE_ATTACHING)
+
+    try:
+        # 1. skini stari sloj
+        lio.backup_config()
+        lio.set_device(name, origin)
+
+        if engine.status(dm_name)["code"] == status.STATUS_OK:
+            destroyed = engine.destroy(dm_name)
+            if destroyed["code"] != status.STATUS_OK:
+                raise _Rollback(destroyed["code"],
+                                destroyed["stderr"] or "dm-cache removal failed.")
+
+        if info.get("cache_type") == "ram":
+            shell.run("ram_destroy.sh")
+
+        # 2. napravi nov (veličina se čita iz konfiguracije — zato
+        #    reset i služi za promenu cache_ram)
+        if cfg["cache_type"] == "ram":
+            ram = shell.run("ram_create.sh",
+                            [cfg["cache_ram"] // 1024**2,
+                             1 if cfg["ram_prealloc"] else 0])
+            if ram["code"] != status.STATUS_OK:
+                raise _Rollback(ram["code"],
+                                ram["stderr"] or "RAM disk creation failed.")
+            cache_dev = ram["stdout"]
+        else:
+            cache_dev = cfg["cache_device"]
+
+        created = engine.create(dm_name, origin, cache_dev, cfg["cache_mode"])
+
+        if created["code"] != status.STATUS_OK:
+            raise _Rollback(created["code"],
+                            created["stderr"] or "dm-cache creation failed.")
+
+        lio.set_device(name, f"/dev/mapper/{dm_name}")
+
+        # --- jedini lio_start ---
+        started = shell.run("lio_start.sh")
+
+        if started["code"] != status.STATUS_OK:
+            raise _Rollback(status.STATUS_LIO_ERROR,
+                            started["stderr"] or "Failed to restart LIO.")
+
+    except _Rollback as e:
+        state.unregister(name)
+        _rollback(engine, dm_name, True, True, None)
+        return _err(e.code, f"{e.message} (rolled back, LIO on origin)")
+
+    duration = round(time.monotonic() - t0, 2)
+
+    state.register(name, {
+        "phase": state.PHASE_ACTIVE,
+        "origin": origin,
+        "origin_at_attach": info.get("origin_at_attach", origin),
+        "cache_type": cfg["cache_type"],
+        "cache_device": cache_dev,
+        "mode": cfg["cache_mode"],
+        "dm_name": dm_name,
+        "backup": info.get("backup", ""),
+    })
+
+    logger.info(f"Cache reset for '{name}' in {duration}s.")
+
+    return {
+        "code": status.STATUS_OK,
+        "message": f"Cache for '{name}' recreated in a single LIO cycle "
+                   f"(downtime {duration}s).",
+        "downtime_seconds": duration,
+    }
+
+
 def cache_status(name):
     """Vrati status + parsiranu statistiku cache-a."""
 
@@ -290,6 +428,65 @@ def validate():
     """Prosleđena validacija (da CLI ima jednu ulaznu tačku)."""
 
     return validator.validate()
+
+
+def status_delta(name, seconds):
+    """
+    Izmeri stanje keša u INTERVALU umesto kumulativno.
+
+    Kumulativni brojači posle više dana mešaju sve što se ikad desilo i
+    ne opisuju nijedno stvarno stanje (vidi docs/field-test.md #3).
+    Ovo uzme dva uzorka i vrati stope između njih.
+    """
+
+    first = cache_status(name)
+
+    if first["code"] != status.STATUS_OK:
+        return first
+
+    time.sleep(seconds)
+
+    second = cache_status(name)
+
+    if second["code"] != status.STATUS_OK:
+        return second
+
+    a, b = first["stats"], second["stats"]
+
+    if not a or not b:
+        return _err(status.STATUS_CACHE_MISSING,
+                    "Cache not active — no statistics to compare.")
+
+    d = {key: b[key] - a[key] for key in (
+        "read_hits", "read_misses", "write_hits", "write_misses",
+        "promotions", "demotions")}
+
+    reads = d["read_hits"] + d["read_misses"]
+    writes = d["write_hits"] + d["write_misses"]
+
+    block_bytes = b["cache_block_size"] * 512
+    promoted_bytes = d["promotions"] * block_bytes
+    cache_bytes = b["cache_total"] * block_bytes
+
+    turnover = (cache_bytes / (promoted_bytes / seconds)
+                if promoted_bytes else None)
+
+    return {
+        "code": status.STATUS_OK,
+        "message": "OK",
+        "interval_seconds": seconds,
+        "delta": d,
+        "rates": {
+            "read_iops": round(reads / seconds, 1),
+            "write_iops": round(writes / seconds, 1),
+            "read_hit_ratio": round(d["read_hits"] / reads, 4) if reads else None,
+            "write_hit_ratio": round(d["write_hits"] / writes, 4) if writes else None,
+            "promotion_mb_per_s": round(promoted_bytes / seconds / 1024**2, 2),
+            "cache_turnover_seconds": round(turnover, 1) if turnover else None,
+        },
+        "cache_usage_percent": b["cache_usage_percent"],
+        "dirty": b["dirty"],
+    }
 
 
 class _Rollback(Exception):

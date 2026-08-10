@@ -85,6 +85,57 @@ def print_validation(result):
         error(result["message"])
 
 
+def print_delta(name, result):
+    """Display interval (rate) statistics instead of cumulative counters."""
+
+    header()
+
+    section(f"Cache: {name} — {result['interval_seconds']}s interval")
+    print()
+
+    d = result["delta"]
+    r = result["rates"]
+
+    section("Rates in interval")
+
+    line("Read IOPS", r["read_iops"])
+    line("Write IOPS", r["write_iops"])
+
+    if r["read_hit_ratio"] is not None:
+        line("Read hit ratio", f'{r["read_hit_ratio"]:.1%} '
+                               f'({d["read_hits"]} hits / '
+                               f'{d["read_misses"]} misses)')
+    else:
+        line("Read hit ratio", "no reads in interval")
+
+    if r["write_hit_ratio"] is not None:
+        line("Write hit ratio", f'{r["write_hit_ratio"]:.1%}')
+
+    print()
+    section("Cache pressure")
+
+    line("Promotion rate", f'{r["promotion_mb_per_s"]} MB/s '
+                           f'({d["promotions"]} blocks)')
+    line("Demotions", d["demotions"])
+
+    if r["cache_turnover_seconds"]:
+        turnover = r["cache_turnover_seconds"]
+        if turnover < 3600:
+            pretty = f"{turnover / 60:.1f} min"
+        else:
+            pretty = f"{turnover / 3600:.1f} h"
+        line("Full cache turnover", pretty)
+        if turnover < 900:
+            warning("Cache turns over faster than 15 min — the working "
+                    "set far exceeds the cache (thrashing).")
+    else:
+        line("Full cache turnover", "no promotions — cache stable")
+
+    print()
+    line("Cache usage", f'{result["cache_usage_percent"]}%')
+    line("Dirty blocks", result["dirty"])
+
+
 def print_status(name, info, stats):
     """Display cache status and statistics."""
 

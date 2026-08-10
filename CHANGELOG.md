@@ -1,5 +1,28 @@
 # Yellowstone Cache — Changelog
 
+## 0.4.0-alpha (2026-08-10)
+
+Sve četiri stavke potekle iz terenskog rada, ne iz teorije.
+
+- **`reset NAME`** — ponovo napravi keš u **jednom** LIO ciklusu.
+  Motiv: `down` na kraju diže LIO, initiatori se za par sekundi
+  zakače, pa `up` mora opet da gasi — i taj drugi teardown visi u
+  D stanju (koštalo nas reboota 10.08.). `reset` radi sve između
+  jednog `lio_stop` i jednog `lio_start`. Ovo je sada preporučeni
+  način za promenu `cache_ram` ili osvežavanje keša.
+- **Preflight provera zauzetosti** (`lib/preflight.py`) — pre svakog
+  gašenja LIO-a uzorkuje se `/proc/diskstats` nad uređajem koji LIO
+  eksportuje. Ako initiator aktivno radi I/O, operacija se **odbija**
+  uz objašnjenje umesto da zaglavi kernel. Zaobilazi se sa `--force`.
+- **`status --delta N`** — stope u intervalu umesto kumulativnih
+  brojača: read/write IOPS, hit ratio za taj interval, brzina
+  promocija u MB/s i **vreme punog obrta keša**. Kumulativni brojači
+  posle više dana ne opisuju nijedno stvarno stanje (Field Test #3:
+  kumulativno 41 %, stvarni režim 34 % uz obrt od 7,5 min).
+  Upozorava ako je obrt ispod 15 minuta (thrashing).
+- **`repair --no-start`** — ne diže LIO na kraju, za slučaj kad odmah
+  sledi druga operacija.
+
 ## 0.3.5-alpha (2026-07-19)
 
 - FIX (systemd auto režim): ExecStart je sada `repair --apply`

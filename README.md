@@ -9,8 +9,7 @@ export. The initiator (VMware ESXi, Windows, Linux) sees the exact same
 disk before and after — same WWN/NAA ID, same LUN number, same ACLs,
 same size. The only thing that changes is speed.
 
-> **Status: alpha.** Tested on one production-like system at [SKGO Standing
-> conference of towns and municipalities] (https://www.skgo.org) (see field
+> **Status: alpha.** Tested on one production-like system (see field
 > test below). Writethrough only for RAM caches — enforced in code.
 > Use at your own risk, read the safety section first.
 
@@ -60,6 +59,8 @@ containers (PHP + MySQL site).
 | Attach downtime (`up`, incl. 12 GiB prealloc) | **9.69 s** |
 | ESXi datastore after attach | **re-detected automatically, same NAA, no resignature** |
 | Cache hit read latency (iostat, cdata device) | **~0.02 ms** |
+| Cache hit latency, end-to-end from the guest (fio, QD1) | **255 µs** (p50 243 µs, p99 392 µs) — vs 10–15 ms for a miss |
+| Warm vs cold cache, identical fio run 3 minutes apart | **468 → 14,400 IOPS**, 272 ms → 8.9 ms |
 | Cache miss read latency (2-disk RAID 0 origin) | 11–50 ms |
 | 1 GiB file copy, read phase served from RAM | **~99 %** (40.6 of 40.7 MB/s) |
 | Writethrough verification | cache-layer write MB/s == origin write MB/s, **dirty blocks 0 at all times** |
@@ -70,10 +71,41 @@ containers (PHP + MySQL site).
 Reads served from cache remained at sub-millisecond latency even while
 the origin array was at 95–98 % utilization under sequential writes.
 
+**Update:** four days after the first attach, the system survived an
+**unplanned datacenter blackout** (generator failure, hard power loss
+mid-I/O). Recovery: one command (`repair --apply`), zero data loss,
+same NAA, no resignature. See Field Test #2.
+
+**Second unplanned outage (2026-08-06):** the host powered down without
+warning after 13 days of uptime (BMC telemetry later showed the main
+rails collapsing to standby draw). Recovery was a single
+`repair --apply` executed **over SSH from off-site** — no console, no
+physical access, zero data loss, datastore re-attached by itself. See
+Field Test #4.
+
+**Worst case matters too:** on a shared LUN also hosting a multi-camera
+NVR and a full-scan backup job, the hit ratio drops to ~34 % (video
+streams interleave and defeat `smq`'s sequential bypass). Even so, the
+16 GiB cache absorbed ~470 of 1,384 requested read IOPS — more than a
+2-spindle array could have delivered on its own. Dirty blocks: 0
+throughout 9 days and ~6 TB of promotions. See Field Test #3.
+
+Full raw data and interpretation: [docs/field-test.md](docs/field-test.md) ·
+Disaster recovery runbook: [docs/recovery.md](docs/recovery.md)
+
 ## Features
 
 - `up NAME` / `down NAME` — attach/detach cache to a LIO backstore in
   one measured downtime window, with automatic rollback on any failure
+- `reset NAME` — rebuild the cache (new size, cold start) inside a
+  **single** LIO stop/start cycle, so initiators never get a window to
+  reconnect and hang the next teardown
+- **Preflight busy check** — sampling `/proc/diskstats` on the exported
+  device before stopping LIO; refuses (rather than hanging the kernel)
+  when an initiator is still driving I/O. `--force` overrides
+- `status --delta N` — interval rates instead of cumulative counters:
+  IOPS, hit ratio for that window, promotion MB/s and **full cache
+  turnover time**, with a warning when the cache recycles in minutes
 - RAM cache (brd) or block-device cache (SSD/NVMe) via `cache_type`
 - Fixed-size RAM cache with optional full preallocation (no OOM
   surprises later; memory visibly reserved at attach time)
@@ -176,8 +208,9 @@ state/, logs/            runtime (not part of the repo)
 - Multiple simultaneous caches (brd currently fixed to /dev/ram0)
 - Warm-cache assemble for SSD caches (metadata preserved across reboot)
 - bcache / lvmcache / dm-writecache engines
-- Preflight check for active initiator sessions before `up`/`down`
 - Monitor mode (migration threshold tuning under array pressure)
 
 ## License
-GPL-2.0 — see [LICENSE](LICENSE).
+
+To be decided before first public release (GPL-2.0 under
+consideration — same ecosystem as the kernel and device-mapper).

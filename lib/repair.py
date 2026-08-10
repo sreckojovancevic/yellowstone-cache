@@ -100,10 +100,14 @@ def inspect(name):
     return info, decision, detail
 
 
-def repair(name, apply=False):
+def repair(name, apply=False, no_start=False):
     """
     Razreši stanje backstore-a `name`.
+
     apply=False (default): samo plan, bez ikakvih izmena.
+    no_start=True: ne diži LIO na kraju — za slučaj kad odmah sledi
+    druga operacija (npr. `up`), pa ne želimo prozor u kom se
+    initiatori zakače i naprave teardown koji visi.
     """
 
     info, decision, detail = inspect(name)
@@ -126,17 +130,18 @@ def repair(name, apply=False):
 
     logger.info(f"repair '{name}': executing {decision} ({detail})")
 
-    result = _execute(decision, name, info)
+    result = _execute(decision, name, info, no_start=no_start)
     result.update({"name": name, "action": decision,
                    "detail": detail, "applied": True})
 
     return result
 
 
-def repair_all(apply=False):
+def repair_all(apply=False, no_start=False):
     """Razreši sve registrovane keševe. Vraća listu rezultata."""
 
-    return [repair(name, apply=apply) for name in state.list_all()]
+    return [repair(name, apply=apply, no_start=no_start)
+            for name in state.list_all()]
 
 
 def _describe(decision, name):
@@ -156,9 +161,12 @@ def _describe(decision, name):
     }[decision]
 
 
-def _execute(decision, name, info):
+def _execute(decision, name, info, no_start=False):
 
     if decision == FINISH_ATTACH:
+        if no_start:
+            state.set_phase(name, state.PHASE_ACTIVE)
+            return _ok(f"'{name}' marked active, LIO left down (--no-start).")
         started = shell.run("lio_start.sh")
         if started["code"] != status.STATUS_OK:
             return _err(status.STATUS_LIO_ERROR,
@@ -167,17 +175,19 @@ def _execute(decision, name, info):
         return _ok(f"'{name}' attach finished, cache active.")
 
     if decision in (ROLLBACK_ATTACH, FINISH_DETACH):
-        return _teardown(name, info, repoint=True)
+        return _teardown(name, info, repoint=True, no_start=no_start)
 
     if decision == CLEANUP:
-        return _teardown(name, info, repoint=False)
+        return _teardown(name, info, repoint=False, no_start=no_start)
 
     if decision == FORGET:
         if info.get("cache_type") == "ram":
             shell.run("ram_destroy.sh")
         state.unregister(name)
-        shell.run("lio_start.sh")
-        return _ok(f"'{name}' forgotten (no system remnants).")
+        if not no_start:
+            shell.run("lio_start.sh")
+        return _ok(f"'{name}' forgotten (no system remnants)."
+                   + (" LIO left down (--no-start)." if no_start else ""))
 
     if decision == RECREATE:
         return _recreate(name, info)
@@ -185,7 +195,7 @@ def _execute(decision, name, info):
     return _ok("No action.")
 
 
-def _teardown(name, info, repoint):
+def _teardown(name, info, repoint, no_start=False):
     """Vrati saveconfig na origin (po potrebi), skini dm/ram, digni LIO.
 
     LIO se PRVO gasi: ako je živ i drži mapper uređaj,
@@ -223,12 +233,17 @@ def _teardown(name, info, repoint):
     if info.get("cache_type") == "ram":
         shell.run("ram_destroy.sh")
 
-    started = shell.run("lio_start.sh")
-    if started["code"] != status.STATUS_OK:
-        return _err(status.STATUS_LIO_ERROR,
-                    started["stderr"] or "Failed to start LIO.")
+    if not no_start:
+        started = shell.run("lio_start.sh")
+        if started["code"] != status.STATUS_OK:
+            return _err(status.STATUS_LIO_ERROR,
+                        started["stderr"] or "Failed to start LIO.")
 
     state.unregister(name)
+
+    if no_start:
+        return _ok(f"'{name}' cleaned up, LIO left down (--no-start).")
+
     return _ok(f"'{name}' cleaned up, LIO on origin.")
 
 
