@@ -256,7 +256,28 @@ state/, logs/            runtime (not part of the repo)
 - bcache / lvmcache / dm-writecache engines
 - Monitor mode (migration threshold tuning under array pressure)
 
+## Acknowledgements
+
+The idea, the architecture and its design principles are the author's —
+in particular the one the whole project rests on: attach a cache to
+existing storage without touching the data or the identity of the
+exported LUN.
+
+Claude (Anthropic) contributed as an implementation and analysis
+partner: extending the codebase, reviewing designs, analysing field-test
+data and proposing instrumentation. The `status --delta` view — interval
+rates, cache turnover time and the thrashing warning — came out of
+analysing the Field Test #3 data and proved itself in Field Test #5,
+correctly flagging a 1.9-minute cache turnover under a sequential read.
+
+That collaboration is documented in both directions: of four performance
+predictions recorded in advance, one was correct. Finding 2 in Field
+Test #5 exists precisely because the reasoning failed loudly enough to
+demand an explanation.
+
+All hardware, measurements, production risk and engineering decisions
+are the author's.
+
 ## License
 
-To be decided before first public release (GPL-2.0 under
-consideration — same ecosystem as the kernel and device-mapper).
+GPL-2.0 — see [LICENSE](LICENSE).
