@@ -61,6 +61,8 @@ raw data: [docs/field-test.md](docs/field-test.md) ·
 
 | Metric | Result |
 |--------|--------|
+| **Cached 4K random read, 8-disk RAID 6 origin** | **84,700 IOPS**, avg 1.49 ms, p99 3.56 ms, 100 % hit ratio |
+| Same test, 2-disk RAID 0 origin | 14,400 IOPS, avg 8.9 ms, p99 183 ms — **the cache is only as fast as the storage it hides** |
 | Attach downtime (`up`, incl. 12 GiB prealloc) | **9.69 s** |
 | ESXi datastore after attach | **re-detected automatically, same NAA, no resignature** |
 | Cache hit read latency (iostat, cdata device) | **~0.02 ms** |
@@ -88,6 +90,20 @@ rails collapsing to standby draw). Recovery was a single
 physical access, zero data loss, datastore re-attached by itself. See
 Field Test #4.
 
+**Third recovery (2026-08-13):** both power cords pulled by mistake
+during a PSU replacement, while the new RAID 6 array was only 49 %
+through its background initialisation — the most fragile state a parity
+array can be in. The controller resumed initialisation from where it
+stopped, `repair --apply` rebuilt the cache, and the datastore
+re-attached itself. See Field Test #6.
+
+**Also measured, on an uncached LUN in the same fabric (Field Test #7):**
+a controller cache policy chosen from plausible reasoning cost **6×
+write throughput** (57 → 366 MiB/s) until a 60-second fio run exposed
+it — after which the bottleneck was no longer the drives but the 4 Gb
+FC link itself. Measuring a device locally *and* through the fabric is
+what makes the difference between the two visible.
+
 **Worst case matters too:** on a shared LUN also hosting a multi-camera
 NVR and a full-scan backup job, the hit ratio drops to ~34 % (video
 streams interleave and defeat `smq`'s sequential bypass). Even so, the
@@ -96,7 +112,8 @@ streams interleave and defeat `smq`'s sequential bypass). Even so, the
 throughout 9 days and ~6 TB of promotions. See Field Test #3.
 
 Full raw data and interpretation: [docs/field-test.md](docs/field-test.md) ·
-Disaster recovery runbook: [docs/recovery.md](docs/recovery.md)
+Disaster recovery runbook: [docs/recovery.md](docs/recovery.md) ·
+Controller/drive findings: [docs/hardware-notes.md](docs/hardware-notes.md)
 
 ## Features
 
