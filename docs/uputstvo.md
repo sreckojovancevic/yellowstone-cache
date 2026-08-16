@@ -238,6 +238,53 @@ iskoristi pre nego što izleti.
 Koristi ovo i pri benchmarkovanju — uzmi `--delta` tokom svakog fio
 prolaza umesto ručnog oduzimanja JSON-a.
 
+## `migration_threshold` — jedina poluga za ponašanje keša
+
+`smq` politika **ne izlaže nijedan podesiv parametar** (vidi se u
+`dmsetup status` kao `smq 0`). Ne postoji način da joj se kaže "ne
+useljavaj sekvencijalni tok" — stari `mq` je imao `sequential_threshold`,
+ali je izbačen iz kernela.
+
+Ono što se **može** podesiti je `migration_threshold` — parametar
+**jezgra dm-cache-a**, ne politike. On ograničava koliko sektora sme da
+se seli (promocije + democije) u jednom trenutku:
+
+```ini
+migration_threshold = 2048    # podrazumevano, 1 MiB
+```
+
+Ne možeš reći *šta* keš ne sme da uzme, ali možeš ograničiti **koliko
+brzo uzima** — a to je posredan način da ga zaštitiš od naleta koji ga
+ionako samo pregazi.
+
+**Kada vredi smanjiti:** kad `status --delta` pokaže obrazac
+
+```
+nizak hit ratio + visok promotion rate + obrt ispod 15 min
+```
+
+To znači da nešto (backup koji čita ceo disk, video tok, migracija)
+useljava blokove koji nikad neće biti pročitani drugi put, izbacujući
+pritom ono što jeste vruće. Spuštanje praga na 512 usporava to
+useljavanje i čuva postojeći sadržaj keša.
+
+**Cena:** dok je prag nizak, keš sporije usvaja i ono što **bi** trebalo
+da usvoji. Nije besplatno — zato se menja na osnovu merenja, ne unapred.
+
+Promena se primenjuje pri sledećem sastavljanju keša:
+
+```bash
+vi /opt/yellowstone/etc/yellowstone.cache    # migration_threshold = 512
+sudo /opt/yellowstone/bin/yellowstone reset TestDisk
+```
+
+Za brzu probu bez `reset`-a, može i u letu (ali se gubi posle reboot-a):
+
+```bash
+sudo dmsetup message TestDiskCached 0 migration_threshold 512
+sudo dmsetup status TestDiskCached      # provera
+```
+
 ## Repair — kada i kako se koristi
 
 `repair` poredi tri izvora istine (state/caches.json, saveconfig.json,

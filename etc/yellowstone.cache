@@ -32,3 +32,20 @@ cache_device =
 # NAPOMENA: ram + writeback je zabranjena kombinacija (gubitak
 # podataka pri nestanku struje) i alat je odbija.
 cache_mode = writethrough
+
+# Koliko sektora dm-cache sme da seli (promocije + democije) u
+# jednom trenutku. Podrazumevano 2048 (1 MiB).
+#
+# Ovo je JEDINA poluga koju kernel daje za ponasanje kesa: smq
+# politika ne izlaze nijedan parametar (`smq 0` u dmsetup status),
+# pa se ne moze reci STA da ne useljava — ali se moze ograniciti
+# KOLIKO BRZO useljava.
+#
+# Nize vrednosti (npr. 512) kocie useljavanje, pa sekvencijalni
+# nalet — backup koji cita ceo disk, video tok, migracija — teze
+# izbaci ono sto je stvarno vruce. Cena: kes sporije usvaja i ono
+# sto BI trebalo da usvoji.
+#
+# Menjaj tek kad `status --delta` pokaze obrazac:
+#   nizak hit ratio + visok promotion rate + obrt ispod 15 min
+migration_threshold = 2048

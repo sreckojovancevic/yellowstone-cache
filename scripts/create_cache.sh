@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# create_cache.sh <name> <origin_device> <cache_device> <mode>
+# create_cache.sh <name> <origin_device> <cache_device> <mode> [migration_threshold]
 #
 # Kreira dm-cache mapiranje:
 #   <name>-cmeta  - linear target za metadata (pocetak cache uredjaja)
@@ -8,17 +8,22 @@
 #   <name>        - cache target iznad origin uredjaja
 #
 # mode: writethrough | writeback
+#
+# migration_threshold: koliko sektora sme da se seli odjednom.
+# Jedina poluga koju kernel daje — smq politika nema nijedan
+# podesiv parametar. Podrazumevano 2048 (1 MiB).
 
 set -o pipefail
 source "$(dirname "$0")/common.sh"
 
-[ $# -eq 4 ] || fail $STATUS_INTERNAL_ERROR \
-    "Usage: create_cache.sh <name> <origin> <cache_dev> <mode>"
+[ $# -ge 4 ] || fail $STATUS_INTERNAL_ERROR \
+    "Usage: create_cache.sh <name> <origin> <cache_dev> <mode> [mig_threshold]"
 
 NAME="$1"
 ORIGIN="$2"
 CACHE_DEV="$3"
 MODE="$4"
+MIGRATION_THRESHOLD="${5:-2048}"
 
 require_root
 check_block_device "$ORIGIN"
@@ -69,6 +74,15 @@ dd if=/dev/zero of="/dev/mapper/${NAME}-cmeta" bs=4K count=1 \
 dmsetup create "$NAME" --table \
     "0 $ORIGIN_SECTORS cache /dev/mapper/${NAME}-cmeta /dev/mapper/${NAME}-cdata $ORIGIN $BLOCK_SIZE 1 $MODE default 0" \
     || cleanup_on_error
+
+# Primeni migration_threshold. Ovo je runtime parametar dm-cache
+# jezgra (ne politike), pa se zadaje porukom posle kreiranja — i
+# zato mora ovde, da bi prezivelo reboot i vazilo posle svakog
+# up / reset / repair --apply.
+if [ "$MIGRATION_THRESHOLD" != "2048" ]; then
+    dmsetup message "$NAME" 0 migration_threshold "$MIGRATION_THRESHOLD" \
+        || echo "WARNING: could not set migration_threshold=$MIGRATION_THRESHOLD" >&2
+fi
 
 echo "/dev/mapper/$NAME"
 exit $STATUS_OK

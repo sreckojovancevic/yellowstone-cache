@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 class CacheEngine(ABC):
 
     @abstractmethod
-    def create(self, name, origin, cache_device, mode):
+    def create(self, name, origin, cache_device, mode, migration_threshold=None):
         """Kreiraj cache mapiranje iznad origin uređaja."""
 
     @abstractmethod

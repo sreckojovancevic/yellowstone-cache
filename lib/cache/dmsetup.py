@@ -12,8 +12,13 @@ from lib import shell
 
 class DmsetupEngine(CacheEngine):
 
-    def create(self, name, origin, cache_device, mode):
-        return shell.run("create_cache.sh", [name, origin, cache_device, mode])
+    def create(self, name, origin, cache_device, mode, migration_threshold=None):
+        args = [name, origin, cache_device, mode]
+
+        if migration_threshold is not None:
+            args.append(migration_threshold)
+
+        return shell.run("create_cache.sh", args)
 
     def destroy(self, name):
         return shell.run("destroy_cache.sh", [name])

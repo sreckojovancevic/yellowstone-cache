@@ -20,6 +20,35 @@ Two mistakes make storage benchmarks worthless:
    comparison collapses. The same cloned VM is moved between arrays
    precisely to keep everything except the storage identical.
 
+## Pre-flight: confirm the controller is idle
+
+**Do this before every measurement.** A background controller task will
+quietly invalidate an entire round of results.
+
+```bash
+MegaCli64 -LDBI    -ShowProg -Lall -a0   # background initialisation
+MegaCli64 -AdpPR   -Info     -aALL       # patrol read
+MegaCli64 -LDCC    -ShowProg -Lall -a0   # consistency check
+MegaCli64 -LDRecon -ShowProg -Lall -a0   # reconstruction / expansion
+```
+
+All must report *not in progress* / `Stopped`. If Patrol Read is active
+it can be paused for the duration and restarted afterwards:
+
+```bash
+MegaCli64 -AdpPR -Stop  -aALL
+# ... measure ...
+MegaCli64 -AdpPR -Start -aALL
+```
+
+This is not a theoretical precaution. In Field Test #5 an active Patrol
+Read made the same array measure **327 IOPS instead of 2,503** and
+**16.6 MiB/s instead of 1,219 MiB/s** — a factor of 73. Numbers taken
+during a scan describe the array *under scan*, and nothing else.
+
+Record in the results whether Patrol Read was disabled, since normal
+operation includes it.
+
 ## Test subject
 
 A small cloned VM (~40 GB, e.g. `waf_wcl_clone`) — migrates between

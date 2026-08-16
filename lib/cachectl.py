@@ -139,7 +139,8 @@ def up(name, force=False):
                                 f"Cache device check failed: {cache_dev}")
 
         # 5. dm-cache
-        created = engine.create(dm_name, origin, cache_dev, cfg["cache_mode"])
+        created = engine.create(dm_name, origin, cache_dev, cfg["cache_mode"],
+                               cfg["migration_threshold"])
 
         if created["code"] != status.STATUS_OK:
             raise _Rollback(created["code"],
@@ -349,7 +350,8 @@ def reset(name, force=False):
         else:
             cache_dev = cfg["cache_device"]
 
-        created = engine.create(dm_name, origin, cache_dev, cfg["cache_mode"])
+        created = engine.create(dm_name, origin, cache_dev, cfg["cache_mode"],
+                               cfg["migration_threshold"])
 
         if created["code"] != status.STATUS_OK:
             raise _Rollback(created["code"],

@@ -10,13 +10,24 @@
 - [Field Test #4](#field-test-4--unexplained-host-reset-remote-recovery)
   — unexplained spontaneous reset, **fully remote recovery**
   (2026-08-06)
+- [Field Test #6](#field-test-6--power-loss-during-array-initialisation)
+  — both power cords pulled mid-BGI; recovery with an uninitialised
+  array underneath (2026-08-13)
+- [Field Test #7](#field-test-7--ssd-tier-where-the-bottleneck-actually-is)
+  — uncached SSD tier measured locally and through the fabric: **a
+  cache policy cost 6× write throughput, and the FC link is the next
+  wall** (2026-08-14)
 - [Field Test #5](#field-test-5--raid-0-vs-raid-6-same-vm-same-cache)
-  — RAID 0 vs RAID 6 on identical VM and cache: **cache hit 255 µs vs
-  10–15 ms miss; 30× IOPS between a cold and a warm cache**
-  (2026-08-10, part 2 pending)
+  — RAID 0 vs RAID 6 on identical VM and cache: **84,700 IOPS at 1.49 ms
+  through the cache, and the discovery that a faster array makes the
+  cache itself 5.9× faster** (2026-08-10 → 2026-08-15, complete)
 
 Measurement procedure for all performance runs:
 [benchmark-protocol.md](benchmark-protocol.md)
+
+Controller and drive findings from building the arrays underneath —
+MegaCli addressing quirks, cache policy choices, drive screening:
+[hardware-notes.md](hardware-notes.md)
 
 ---
 
@@ -184,7 +195,7 @@ throughput in every interval, dirty blocks 0 throughout.
 
 # Field Test #2 — Unplanned blackout recovery
 
-Date: 2026-07-23
+Date: 2026-07-23 · Yellowstone Cache **v0.3.5-alpha**
 **This was not a scheduled test.** A real datacenter blackout provided
 the harshest possible validation: violent power loss mid-I/O, cold
 start, full recovery.
@@ -263,7 +274,7 @@ The ESXi side needed hands-on recovery, now documented in
 
 # Field Test #3 — Nine-day run & worst-case cache behaviour
 
-Date: 2026-08-02 (uptime 8d 22h since blackout recovery)
+Date: 2026-08-02 · Yellowstone Cache **v0.3.5-alpha** (uptime 8d 22h since blackout recovery)
 
 The most important test so far is not the best-case number — it is
 what the cache does when the workload actively fights it.
@@ -286,11 +297,16 @@ six VMs — deliberately not split:
 | wcl_proxy_new_U | 74 GB | (off) | — |
 
 Environment note: VMFS automatic space reclamation is enabled at
-100 MB/s on all datastores. dm-cache handles UNMAP correctly —
-discarded blocks are invalidated in cache and the discard is passed
-down to the origin, so reclamation and caching coexist without stale
-data. (On HDD-backed hardware RAID the controller typically drops the
-discard anyway — harmless either way.)
+100 MB/s on all datastores. dm-cache invalidates the affected cache
+blocks, so reclamation and caching coexist without stale data.
+
+**Correction (2026-08-15):** an earlier version of this note claimed the
+discard is also passed down to the origin. It is not — `dmsetup status`
+on this system reports the `no_discard_passdown` feature, which the
+kernel sets automatically because the H700 virtual disk over spinning
+disks does not advertise discard support. UNMAP therefore stops at the
+cache layer. Harmless for HDDs, but worth knowing before assuming TRIM
+reaches an SSD tier behind the same controller.
 
 ## Cumulative counters after 9 days
 
@@ -394,7 +410,7 @@ variable test of the video-pollution hypothesis.
 
 # Field Test #4 — Unexplained host reset, remote recovery
 
-Date: 2026-08-06
+Date: 2026-08-06 · Yellowstone Cache **v0.3.5-alpha**
 
 Second unplanned outage, and the first one recovered **entirely
 remotely** — no console, no site access, no manual dm/LIO surgery.
@@ -556,7 +572,8 @@ before the next event:
 
 # Field Test #5 — RAID 0 vs RAID 6, same VM, same cache
 
-Date: 2026-08-10 → *(in progress)*
+Date: 2026-08-10 → *(in progress)* · Yellowstone Cache
+**v0.3.5-alpha** (baseline) → **v0.4.0-alpha**
 
 A controlled A/B that only exists because it was taken **before the old
 array was destroyed**: the same cloned VM, the same 16 GiB RAM cache,
@@ -668,27 +685,376 @@ reported **286 MiB/s** sequential read. The first number is
 latency-bound (10 ms × ~100 IOPS), not a throughput measurement.
 Benchmarks must state queue depth or they state nothing.
 
-## Part 2 — `RAID6-8disk` (pending rebuild)
+## Part 2 — `RAID6-8disk` (measured 2026-08-15)
 
-Predictions recorded **before** the measurement, so they can be scored
-honestly afterwards:
+```text
+LABEL : RAID6-8disk / 16 GiB RAM cache / writethrough
+ARRAY : 8 × 8 TB, RAID 6, 43.7 TB usable, 64 KB strip,
+        WriteBack / ReadAdaptive / Direct, BGI complete
+CACHE : reset immediately before the run (cold start)
+PATH  : guest → ESXi 7.0 → 4 Gb FC → LIO → dm-cache → array
+GUEST : cloned VM, raw 100 GB virtual disk, unlimited IOPS,
+        the only VM powered on
+NOTE  : Patrol Read **stopped** for the duration of the measurements
+        and restarted afterwards
+```
 
-| Run | RAID0-2disk | Expectation for RAID6-8disk | Reasoning |
-|-----|-------------|------------------------------|-----------|
-| B array (rand read) | 739 IOPS | **3–4× better** | 8 spindles instead of 2; this is the ceiling the rebuild exists to raise |
-| C rand write | 806 IOPS | **uncertain — may barely improve** | RAID 0 pays no parity cost; RAID 6 pays read-modify-write on every small write. More spindles vs. worse per-write cost |
-| D sequential | 286 MiB/s | **> 800 MiB/s** | 6 data spindles streaming |
-| A3 hot / A-lat | 14,400 IOPS / 255 µs | **roughly unchanged** | same RAM, same FC path — the cache path does not depend on the array |
-| A1 cold | 468 IOPS | improves with B | cold pass is array-bound by definition |
+### Through the fabric — RAID 0 vs RAID 6, same VM, same cache
 
-The honest expectation is that **the cache path stays the same and the
-miss path gets much faster** — which should raise the floor of the
-system far more than its ceiling.
+| Run | RAID0-2disk | RAID6-8disk | Change |
+|-----|-------------|-------------|--------|
+| A2 warm (8 GiB) | 1,042 IOPS | 57,600 IOPS | 55× |
+| **A3 hot (8 GiB)** | 14,400 IOPS / 8.9 ms / p99 **183 ms** | **84,700 IOPS / 1.49 ms / p99 3.56 ms** | **5.9× IOPS, 51× better p99** |
+| **B array (64 GiB rand read)** | 739 IOPS | **1,772 IOPS** | **2.4×** |
+| **C rand write (64 GiB)** | 806 IOPS | **462 IOPS** | **0.57× — worse** |
+| D sequential read | 286 MB/s | **373 MiB/s** | 1.3× — *at the FC ceiling* |
 
-## Planned hardening in the same maintenance window
+### The array on its own (local, no cache, no fabric)
 
-The rebuild window is also being used for everything the previous
-incidents recommended:
+| Test | Result |
+|------|--------|
+| 4K random read, QD32 × 4 | **2,503 IOPS** |
+| 1 MiB sequential read, QD8 | **1,219 MiB/s** (1,278 MB/s), 6.5 ms avg |
+
+### Cache behaviour during each run (`status --delta 60`)
+
+| During | Read hit ratio | Promotions | Turnover |
+|--------|---------------|------------|----------|
+| A3 (8 GiB working set) | **100.0 %** — 4,813,473 hits, **0 misses** | 2 blocks | 540 h |
+| B (64 GiB working set) | 35.2 % | 60.7 MB/s | **4.5 min** ⚠ |
+| C (random write) | write hit 49.7 % | 13.0 MB/s | 20.7 min |
+| D (sequential read) | 34.1 % | **144.8 MB/s** | **1.9 min** ⚠ |
+
+## Finding 1 — a background controller task invalidated an entire round
+
+The first set of local measurements produced numbers that made no
+physical sense: **327 IOPS** random and **16.6 MiB/s** sequential —
+slower than a single disk, from eight spindles.
+
+The cause was **Patrol Read**, which had started on schedule at 04:00
+that morning and was still scanning every sector of all eight drives
+(`Current State: Active`, `PDs completed: 0`). Repeating the identical
+tests with it stopped:
+
+| Test | During Patrol Read | Clean | Factor |
+|------|-------------------|-------|--------|
+| 4K random read | 327 IOPS | **2,503 IOPS** | **7.6×** |
+| Sequential read | 16.6 MiB/s | **1,219 MiB/s** | **73×** |
+
+Seventy-three times. Without that check, the documentation would have
+recorded a RAID 6 array as slower than one of its own drives.
+
+**This is now a mandatory pre-flight step in
+[benchmark-protocol.md](benchmark-protocol.md):** before any
+measurement, confirm the controller is idle —
+
+```bash
+MegaCli64 -LDBI  -ShowProg -Lall -a0   # background initialisation
+MegaCli64 -AdpPR -Info     -aALL       # patrol read
+MegaCli64 -LDCC  -ShowProg -Lall -a0   # consistency check
+MegaCli64 -LDRecon -ShowProg -Lall -a0 # reconstruction
+```
+
+Everything measured while one of these runs describes the array *under
+scan*, not the array.
+
+## Finding 2 — a faster array makes the cache faster, too
+
+The prediction recorded before the run was that the cache path would be
+*"roughly unchanged — same RAM, same FC path"*. It was wrong by 5.9×.
+
+```text
+A3 hot, RAID 0 origin :  14,400 IOPS | avg 8.9 ms  | p99 183 ms  | 97.6 % hits
+A3 hot, RAID 6 origin :  84,700 IOPS | avg 1.49 ms | p99 3.56 ms | 100 % hits
+```
+
+Two mechanisms, and neither is the RAM getting faster:
+
+1. **Misses share the queue with hits.** On the 2-disk origin a miss
+   cost ~270 ms and blocked everything queued behind it, so a 2.4 %
+   miss rate dragged the whole distribution — hence p99 of 183 ms. On
+   eight spindles a miss costs ~75 ms, the tail collapses, and the
+   distribution lifts as a whole.
+2. **A faster origin warms the cache faster.** RAID 0 needed three
+   passes to reach 97.6 %; RAID 6 reached 100 % — literally zero misses
+   — by the third. With no misses at all there is nothing left to drag.
+
+**A cache is only as fast as the storage it is hiding.** That is not
+intuitive, and it is the single most useful thing this comparison
+produced.
+
+## Finding 3 — RAID 6 is *worse* than RAID 0 at random writes
+
+| | RAID 0 | RAID 6 |
+|---|--------|--------|
+| 4K random write | 806 IOPS | **462 IOPS** (−43 %) |
+| avg latency | 159 ms | **276 ms** |
+| p99 | 401 ms | **776 ms** |
+
+Four times the spindles, and it still loses. RAID 0 writes a block and
+is done; RAID 6 must read the old block, read both parity blocks,
+compute the new parity and write three things back. Eight drives cannot
+outrun six times the work per operation.
+
+Practical reading: this array is built for **capacity, redundancy and
+read throughput**, and its workload — an archive that writes
+sequentially and VMs that mostly read — fits that. A write-heavy
+database would not belong here.
+
+## Finding 4 — the bottleneck is now the fabric, on every profile
+
+```text
+sequential, array locally   1,219 MiB/s
+sequential, through 4 Gb FC   373 MiB/s   (peak 398 — the link's ceiling)
+────────────────────────────────────────
+unusable through the fabric      69 %
+```
+
+And the cached path reached the same wall from the other side: A3 ran
+at 331 MiB/s with peaks of 337 MiB/s — the **cache** is now fast enough
+to saturate the link on its own.
+
+So the case for 8 Gb HBAs is no longer an assumption. Three independent
+measurements point at it: the SSD tier (Field Test #7), the RAID 6
+array, and the RAM cache. All three exceed what a 4 Gb link can carry.
+The switch (Brocade 300) already supports 8 Gb and the primary Lenovo
+array has 16 Gb ports throttled to 4 Gb by the SFPs alone — replacing
+switch-side SFPs alone would double *that* array's link with no other
+change.
+
+## Finding 5 — `smq` does not fully bypass sequential reads either
+
+During run D — a pure 1 MiB sequential read — the cache promoted
+**144.8 MB/s**, roughly 39 % of the stream, and turned over completely
+every 1.9 minutes. Combined with the sequential-write finding in Field
+Test #5 Part 1, the picture is:
+
+> Sequential bypass in `smq` is partial and workload-dependent. Do not
+> assume a streaming workload will leave a cache untouched — measure it.
+
+## Predictions, scored
+
+Written down before the measurements so they could be judged honestly:
+
+| Prediction | Actual | |
+|-----------|--------|---|
+| B: 3–4× better | 2.4× | ⚠️ optimistic — the chain costs ~29 % (2,503 local → 1,772 through FC) |
+| C: "uncertain, may barely improve" | **43 % worse** | ❌ right to hedge, wrong on direction |
+| D locally: > 800 MB/s | 1,219 MB/s | ✅ |
+| A3: "roughly unchanged" | **5.9× better** | ❌ the reasoning ignored queue coupling |
+
+One of four. Which is the argument for writing predictions down at all:
+being wrong in public is how the reasoning gets corrected, and Finding
+2 exists only because the prediction failed loudly enough to demand an
+explanation.
+
+---
+
+# Field Test #6 — Power loss during array initialisation
+
+Date: 2026-08-13 · Yellowstone Cache **v0.4.0-alpha**
+
+The shortest incident so far, and the one with a condition none of the
+previous tests covered: the storage node lost power **while the RAID 6
+array underneath was still being initialised.**
+
+## What happened
+
+While swapping the power supplies, both cords were pulled at once and
+the server went down instantly — no shutdown, no flush, nothing.
+
+State at the moment of the outage:
+
+- RAID 6 (8 × 8 TB) at **49 % background initialisation** — parity for
+  the remaining half of the array was not yet computed
+- Yellowstone cache attached, LIO exporting the LUN
+- Array otherwise empty (data migration not yet performed)
+
+## Recovery
+
+```text
+Background Initialization on VD #1 ... Complete 76% in 1089 Minutes   ← resumed
+PS Redundancy | 74h | ok | 7.1 | Fully Redundant                      ← new PSUs
+yellowstone repair            → action: recreate
+yellowstone repair --apply    → 'TestDisk' cache recreated, LIO up
+```
+
+The datastore reappeared on the hosts by itself, as in every previous
+recovery.
+
+| Check | Outcome |
+|-------|---------|
+| Controller background init | **resumed from where it stopped** — progress is held in controller NVRAM, not restarted from 0 % |
+| Controller write-back cache | protected by the BBU (verified healthy before the array was built) and flushed on power-up |
+| Cache layer | rebuilt by `repair --apply` — third unplanned recovery, same single command |
+| Data | none at risk (array empty), but writethrough means none would have been in any case |
+| Operator error tolerance | full recovery from a mistake that would normally mean a long afternoon |
+
+## Why it is worth recording
+
+1. **An initialising array is the most fragile state a RAID 6 can be
+   in** — parity is incomplete, so a disk failure during that window
+   cannot be reconstructed. Losing power in exactly that state and
+   coming back cleanly is a useful data point, not a trivial one.
+2. **BGI progress survives power loss.** Worth knowing before anyone
+   panics and restarts an initialisation that was already 76 % done.
+3. **The recovery procedure did not care what state the array was in.**
+   `repair` compares state, saveconfig and the kernel — the array's
+   internal condition is simply not one of its inputs, which is why the
+   same single command has now handled a datacenter blackout, an
+   unexplained host reset and a pulled power cord.
+
+## Power path closed out in the same window
+
+Both power supplies were replaced — the leading suspect from Field Test
+#4 — and the two feeds were traced and confirmed to run from **separate
+breaker panels**: one generator-backed, one on UPS.
+
+That diversity changes the standing diagnosis. A single upstream
+electrical event can no longer explain a simultaneous loss of both
+rails, because the two supplies no longer share an upstream. So if the
+unexplained reset ever repeats, the remaining candidates are internal:
+the power distribution board or the mainboard.
+
+Measurement from here is simply elapsed time. Previous behaviour: 13
+days of flawless operation, then a reset out of nowhere. The clock
+starts again.
+
+---
+
+# Field Test #7 — SSD tier: where the bottleneck actually is
+
+Date: 2026-08-14
+
+A second LUN was added to the same LIO target: two used consumer SATA
+SSDs in RAID 0, **deliberately without a Yellowstone cache** (RAM in
+front of SSD is marginal, and the layer would have to be reassembled
+after every reboot for little gain).
+
+That makes it a useful control: the same fabric, the same host, the
+same fio profiles — but no caching anywhere in the path. Whatever it
+measures is the storage and the chain, nothing else.
+
+## Configuration
+
+| | |
+|---|---|
+| Drives | 2 × Transcend TS480GSSD220S, 480 GB, used (90 % / 91 % life remaining, ~15 TB / ~13 TB written) |
+| Array | RAID 0, 893 GB usable, 64 KB strip, PERC H700 |
+| Over-provisioning | **none** — the VD was created at full capacity |
+| Fabric | 4 Gb FC → VMware ESXi 7.0, VMFS 6, no Yellowstone cache |
+| Guest | cloned VM, raw 100 GB virtual disk, unlimited IOPS |
+
+## Measurements
+
+Local (`/dev/sdc` on the storage node — the array's own capability):
+
+| Test | Result | Limited by |
+|------|--------|------------|
+| 4K random read, QD32 × 4 jobs | **67,100 IOPS** / 262 MiB/s, 1.89 ms avg, 99.9 % util | the drives |
+| 1 MiB sequential read, QD8 | **953 MiB/s**, 8.3 ms avg (σ 182 µs) | the drives |
+
+Through the fabric, from the guest:
+
+| Test | Result | Limited by |
+|------|--------|------------|
+| 1 MiB sequential write, **WriteThrough** | **57 MiB/s**, p50 64 ms but **p90 451 ms**, bandwidth swinging 4–136 MB/s | **the cache policy** |
+| 1 MiB sequential write, **WriteBack** | **~366 MiB/s sustained, no drops** | **the FC link** |
+
+## Finding 1 — a cache policy cost 6× write throughput
+
+WriteThrough was chosen deliberately, on the reasoning that these are
+consumer SSDs without power-loss protection and that the FC link would
+mask any performance difference anyway. **Both halves of that reasoning
+were wrong**, and the measurement is what showed it.
+
+The failure signature was distinctive: median latency 64 ms but p90 at
+**451 ms**, and throughput oscillating between 4 and 136 MB/s. That is
+not a slow device — that is a device being starved of parallelism.
+
+Why it happens: under WriteThrough the controller must wait for each
+write to be acknowledged by the drive before acknowledging the host, so
+a guest queue depth of 8 means **at most 8 writes in flight to the
+array**. Under WriteBack the controller acknowledges immediately and
+then drives the SSDs with a far deeper queue of its own — the drives
+work in parallel instead of in single file.
+
+So WriteBack is not merely "buffering". It decouples the host's queue
+depth from the drives', which is exactly what SSDs need.
+
+**On the safety argument:** the BBU protects the *controller's* cache.
+The risk from a consumer SSD's own volatile write buffer exists in
+both modes and is unaffected by this setting. WriteThrough was
+therefore buying nothing while costing 6×. The VD is also configured
+*No Write Cache if Bad BBU*, so it degrades to WriteThrough by itself
+if the battery ever fails.
+
+## Finding 2 — the bottleneck moved to the fabric
+
+With the policy fixed, sustained writes settled at **366 MiB/s** — and
+a 4 Gb FC link carries roughly 380–400 MB/s per direction. The array is
+no longer the constraint; the link is.
+
+The whole picture across layers:
+
+```text
+local sequential read     953 MiB/s   ← the drives can do this
+through 4 Gb FC           366 MiB/s   ← this is what arrives
+```
+
+Note also that a VM clone from the QNAP array to this SSD LUN ran at
+~245 MB/s in each direction simultaneously. That is only possible
+because **Fibre Channel is full duplex** — a 4 Gb link carries ~400
+MB/s *each way* at once, not 400 MB/s in total. (An earlier reading of
+these numbers assumed the directions shared one budget and concluded,
+wrongly, that VAAI offload must have been involved. VAAI XCOPY cannot
+span two different arrays.)
+
+**Upgrade implication, quantified rather than assumed:**
+
+| Profile | 4 Gb today | 8 Gb would give | Worth it? |
+|---------|-----------|-----------------|-----------|
+| Sequential | capped at ~380 MB/s | ~760 MB/s | **yes — the drives already exceed the link** |
+| 4K random | 268 MB/s at 67k IOPS | unchanged | **no — never approaches the ceiling** |
+
+The switch (Brocade 300) already supports 8 Gb, but link speed is set
+by the slowest element: with 4 Gb HBAs at both ends, 8 Gb SFPs change
+nothing. Both ends would need replacing.
+
+## Finding 3 — what was left on the table
+
+Over-provisioning was discussed and then skipped when the VD was
+created at full capacity. On used consumer SSDs behind a controller
+that does not pass TRIM through a RAID volume, the FTL considers every
+block occupied, so writes carry maximum write amplification.
+
+WriteBack masked this well enough that it stopped being the limiting
+factor — but if sustained write performance ever degrades, the fix is
+known: destroy the VD, `blkdiscard` both drives to reset the FTL, and
+recreate leaving 15–20 % unallocated.
+
+## Lessons
+
+1. **Measure the layer, not the assumption.** WriteThrough was chosen
+   from reasoning that sounded sound and was wrong by a factor of six.
+   One 60-second test found it.
+2. **A bottleneck is never removed, only moved.** Drives → cache policy
+   → fabric, twice in one afternoon. The value is in knowing which one
+   you are standing on.
+3. **Measure locally and through the fabric.** Either number alone is
+   misleading: 953 MB/s local overstates what applications get, 366
+   MB/s through FC understates what the hardware can do. The gap
+   between them is the price of the chain — and the business case for
+   any upgrade.
+4. **Fibre Channel is full duplex.** Summing both directions against
+   one budget produces conclusions that are not merely wrong but
+   inventive.
+
+---
+
+# Hardening checklist for the rebuild window
+
+Everything the earlier incidents recommended, collected in one place:
 
 - SMART screening of every used drive before it enters the array
   (`Reallocated_Sector_Ct`, `Current_Pending_Sector`, overall health);
@@ -702,3 +1068,11 @@ incidents recommended:
 - 4 bays reserved for a future SSD tier (original Dell 3.5″→2.5″
   carriers sourced; over-provision 15–20 % since the controller does
   not pass TRIM through a RAID volume)
+- **done:** both PSUs replaced, feeds verified on separate breaker
+  panels (Field Test #6)
+- **done:** Patrol Read enabled weekly — the array contains five drives
+  with 48,086 hours each, all from the same batch, so latent sector
+  errors must be found while the array is healthy rather than during a
+  rebuild
+- **pending:** memtest86+ pass; kdump `crashkernel=` verified active
+  after the next boot

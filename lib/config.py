@@ -26,6 +26,7 @@ DEFAULTS = {
     "memory_headroom": "4G",
     "cache_device": "",
     "cache_mode": "writethrough",
+    "migration_threshold": 2048,
 }
 
 VALID_MODES = ("writethrough", "writeback")
@@ -72,6 +73,9 @@ def load_config():
             "memory_headroom": parse_size(get("memory_headroom")),
             "cache_device": get("cache_device"),
             "cache_mode": get("cache_mode"),
+            "migration_threshold": parser.getint(
+                "cache", "migration_threshold",
+                fallback=DEFAULTS["migration_threshold"]),
         }
     except ValueError as e:
         raise ConfigError(f"Invalid value in config: {e}")
@@ -97,6 +101,13 @@ def load_config():
 
     if cache["cache_type"] == "ram" and cache["cache_ram"] < 64 * 1024**2:
         raise ConfigError("cache_ram must be at least 64M.")
+
+    # dm-cache odbija vrednosti manje od velicine cache bloka;
+    # gornja granica je proizvoljna, ali stiti od ocigledne greske.
+    if not 64 <= cache["migration_threshold"] <= 1048576:
+        raise ConfigError(
+            f"migration_threshold {cache['migration_threshold']} out of "
+            "range (64–1048576 sectors; default 2048).")
 
     return {"cache": cache}
 

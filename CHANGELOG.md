@@ -1,5 +1,33 @@
 # Yellowstone Cache — Changelog
 
+## 0.4.1-alpha (2026-08-15)
+
+- **`migration_threshold` u konfiguraciji.** Prva funkcija koja dolazi
+  iz ideje, a ne iz problema koji nas je snašao — inspirisana starim
+  *short stroking* pristupom kod diskova: ako ne možeš ubrzati skupu
+  operaciju, ograniči je.
+
+  `smq` politika ne izlaže nijedan parametar (`smq 0` u `dmsetup
+  status`), a stari `mq` sa `sequential_threshold` je izbačen iz
+  kernela. Jedina preostala poluga je `migration_threshold` — parametar
+  **jezgra dm-cache-a**, koji ograničava koliko sektora sme da se seli
+  odjednom.
+
+  Ne može se reći *šta* keš ne sme da useli, ali može **koliko brzo** —
+  što štiti postojeći sadržaj od sekvencijalnih naleta koji ionako neće
+  biti čitani drugi put (Field Test #5: prep upis od 64 GB napunio keš
+  do 99,7 %, a D test promovisao 144 MB/s sekvencijalnog čitanja).
+
+  Postavlja se automatski pri svakom `up`, `reset` i `repair --apply`,
+  pa preživljava reboot. Podrazumevano ostaje 2048 (1 MiB) — menja se
+  tek kad `status --delta` pokaže thrashing.
+
+- **Ispravka u dokumentaciji:** ranije je pisalo da dm-cache prosleđuje
+  discard na origin. Na hardverskom RAID-u nad vretenima kernel sam
+  postavlja `no_discard_passdown` (vidljivo u `dmsetup status`), pa se
+  UNMAP zaustavlja na kešu. Keš i dalje ispravno poništava svoje
+  blokove; samo se dalje ne prosleđuje.
+
 ## 0.4.0-alpha (2026-08-10)
 
 Sve četiri stavke potekle iz terenskog rada, ne iz teorije.

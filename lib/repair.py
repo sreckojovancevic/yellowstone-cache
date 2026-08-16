@@ -275,7 +275,8 @@ def _recreate(name, info):
         cache_dev = info["cache_device"]
 
     created = engine.create(info["dm_name"], info["origin"],
-                            cache_dev, info["mode"])
+                            cache_dev, info["mode"],
+                            cfg["migration_threshold"])
     if created["code"] != status.STATUS_OK:
         return _err(created["code"],
                     created["stderr"] or "dm-cache creation failed.")
