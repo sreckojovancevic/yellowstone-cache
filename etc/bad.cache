@@ -1,0 +1,3 @@
+[cache]
+cache_type = ram
+cache_mode = writeback

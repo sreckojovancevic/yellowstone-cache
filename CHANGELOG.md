@@ -1,5 +1,35 @@
 # Yellowstone Cache — Changelog
 
+## 0.4.2-alpha (2026-08-17)
+
+- **Bezbednosna ispravka: `writeback` se odbija na SVAKOM tipu keša,
+  ne samo na RAM-u.** Pravilo je do sada pokrivalo `cache_type=ram`;
+  `cache_type=device` + `writeback` prolazilo je bez ijedne reči.
+
+  Posledica bi bila teža od gubitka keša. `create()` nulira
+  metapodatke pri svakom sastavljanju — prljavi blokovi bi fizički
+  ostali na SSD-u, ali bi jedina evidencija o tome kom bloku origin-a
+  pripadaju bila obrisana. To nije prazan keš nego **tiho
+  nekonzistentan origin**, koji se otkriva tek kada neki VM ne uspe
+  da se digne. I ne bi se desilo greškom operatera: `repair --apply`
+  iz systemd-a uradio bi to sam, pri prvom podizanju posle pada.
+
+  Uslov za uklanjanje pravila je warm assemble — sastavljanje bez
+  nuliranja, uz proveru block size i veličina, obradu `needs_check`
+  preko `cache_check`, i flush kroz `cleaner` politiku pri rušenju.
+  Poruka o grešci imenuje taj uslov i upućuje na
+  `docs/design-l2.md` §8.
+
+- **Nov dokument: `docs/design-l2.md`** — dvoslojni keš (RAM iznad
+  SSD-a). Izričito označen kao **neproveren plan**, sa predviđanjima
+  upisanim unapred da bi se posle mogla pošteno oceniti, kao u Field
+  Testu #5. Ne ulazi u `field-test.md` dok se ne izmeri.
+
+- **Field Test #8** — običan copy/paste fajla od 10 GB između dva
+  VM-a ispao je prvo direktno merenje RAID 6 read-modify-write
+  kazne, i sudio je ranijem zaključku o 8 Gb fabric-u: pomaže
+  čitanju, ne upisu.
+
 ## 0.4.1-alpha (2026-08-15)
 
 - **`migration_threshold` u konfiguraciji.** Prva funkcija koja dolazi

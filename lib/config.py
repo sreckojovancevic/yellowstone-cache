@@ -6,9 +6,15 @@ Yellowstone Cache
 Učitavanje konfiguracije iz etc/yellowstone.cache.
 
 Vraća ugnježdenu strukturu {"cache": {...}}.
-Bezbednosno pravilo ugrađeno u kod: cache_type=ram dozvoljava
-ISKLJUČIVO writethrough (RAM + writeback = gubitak podataka
-pri nestanku struje).
+
+Dva tvrda bezbednosna pravila ugrađena u kod, oba bez override-a:
+
+  1. cache_type=ram dozvoljava ISKLJUČIVO writethrough
+     (RAM + writeback = gubitak podataka pri nestanku struje).
+  2. cache_mode=writeback se odbija i na trajnom uređaju, dok
+     ne postoji warm assemble — metapodaci se nuliraju pri svakom
+     sastavljanju, pa bi prljavi blokovi nestali zajedno sa
+     mapiranjima, a origin ostao tiho nekonzistentan.
 """
 
 import configparser
@@ -95,6 +101,26 @@ def load_config():
         raise ConfigError(
             "cache_type=ram allows only writethrough. "
             "RAM + writeback means data loss on power failure.")
+
+    # Isto pravilo, drugi razlog. Writeback na trajnom uredaju je
+    # ispravna ideja i krajnji cilj, ali NE sa ovim kodom: create()
+    # nulira metapodatke pri svakom sastavljanju. Prljavi blokovi bi
+    # fizicki ostali na SSD-u, a jedina evidencija o tome kom bloku
+    # origin-a pripadaju bila bi obrisana. Rezultat nije izgubljen kes
+    # nego TIHA KORUPCIJA origin-a, koja se otkriva tek kada neki VM
+    # ne uspe da se digne. repair --apply iz systemd-a bi to uradio
+    # sam, pri prvom podizanju posle pada.
+    #
+    # Uslov za uklanjanje ovog pravila: warm assemble (sastavljanje
+    # bez nuliranja metapodataka, uz proveru block size / velicina i
+    # obradu needs_check), plus flush preko cleaner politike pri
+    # rusenju. Vidi docs/design-l2.md, sekcija 8.
+    if cache["cache_type"] == "device" and cache["cache_mode"] == "writeback":
+        raise ConfigError(
+            "cache_mode=writeback is not supported yet: cache metadata is "
+            "zeroed on every assembly, so dirty blocks held on the cache "
+            "device would be silently lost and the origin left inconsistent. "
+            "Requires warm assemble first (docs/design-l2.md §8).")
 
     if cache["cache_type"] == "device" and not cache["cache_device"]:
         raise ConfigError("cache_type=device requires cache_device.")

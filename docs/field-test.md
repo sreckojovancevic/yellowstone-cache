@@ -21,6 +21,16 @@
   — RAID 0 vs RAID 6 on identical VM and cache: **84,700 IOPS at 1.49 ms
   through the cache, and the discovery that a faster array makes the
   cache itself 5.9× faster** (2026-08-10 → 2026-08-15, complete)
+- [Field Test #8](#field-test-8--guest-to-guest-copy-read-modify-write-measured)
+  — an ordinary 10 GB file copy between two VMs: **the RAID 6
+  read-modify-write penalty measured directly, and the 8 Gb upgrade
+  case narrowed to reads only** (2026-08-16)
+- [Field Test #9](#field-test-9--a-working-day-measured-layer-by-layer)
+  — a full working day captured unfiltered: **the read path decomposed
+  across three layers (0.010 ms RAM / 12.77 ms array / 0.08 ms as the
+  guest sees it), the fabric at 19.9 % of capacity in its busiest
+  minute, and the discovery that the cumulative counters had been
+  measuring our own benchmarks** (2026-08-17)
 
 Measurement procedure for all performance runs:
 [benchmark-protocol.md](benchmark-protocol.md)
@@ -1052,6 +1062,664 @@ recreate leaving 15–20 % unallocated.
 
 ---
 
+# Field Test #8 — Guest-to-guest copy: read-modify-write, measured
+
+Date: 2026-08-16
+
+Two VMs (Windows 10 and Server 2012) on the **same ESXi host**, both
+with their virtual disks on the 48 TB Yellowstone-cached datastore,
+connected to each other through vmxnet3. A 10 GB file was copied over
+SMB from one guest to the other.
+
+The intent was a casual sanity check. It turned into the first direct
+measurement of the RAID 6 write penalty, and a correction to Field
+Test #7.
+
+## The number that could not be true
+
+Windows reported **1.06 GB/s**, sustained, with 7.93 GB still to go.
+
+That is 8.5 Gbit/s across a 4 Gb link that carries roughly 380 MB/s per
+direction. No arrangement of caching makes that number a storage
+throughput.
+
+What actually produced it:
+
+```text
+VM A: file already resident in the Windows page cache (RAM)
+  ↓   vmxnet3, same host — a memory copy, never reaches a physical NIC
+VM B: received into the write buffer (RAM)
+  ↓   only from here does anything reach storage
+FC 4 Gb → LIO → dm-cache (writethrough) → RAID 6
+```
+
+The first two hops are RAM to RAM. The dialog was reporting the rate at
+which data was *accepted*, not the rate at which it was *stored*.
+
+**A hypothesis worth recording because it was wrong:** that the data
+never crossed the fabric at all — same host, same datastore, therefore
+VMware handles it internally. That holds for the network hop and fails
+for the storage hop. The vmdk blocks physically reside on the array,
+and the only path from the host to those blocks is the FC link; there
+is no second cable. ESXi has no read cache for VMFS data (CBRC exists
+only for VDI linked clones and is off by default).
+
+Rather than argue the point, a falsifiable test was defined in advance:
+if the data bypassed the fabric, Yellowstone's counters would not move
+at all.
+
+## What the cache saw
+
+`yellowstone status TestDisk --delta 10`, during the copy:
+
+```text
+Read IOPS             : 1.0
+Write IOPS            : 4222.6
+Read hit ratio        : 100.0% (10 hits / 0 misses)
+Write hit ratio       : 91.0%
+Promotion rate        : 8.43 MB/s (337 blocks)
+Demotions             : 337
+Full cache turnover   : 32.1 min
+Cache usage           : 100.0%
+Dirty blocks          : 0
+```
+
+Both halves of the explanation are in those two lines:
+
+- **Read IOPS 1.0** — reads genuinely did not reach storage. The source
+  file was in the guest's page cache, which is why 1.06 GB/s was
+  achievable at all.
+- **Write IOPS 4222.6** — writes did reach storage. The counters moved,
+  so the fabric was in the path.
+
+## What iostat saw
+
+`iostat -x 5 /dev/mapper/TestDiskCached`, selected intervals:
+
+| Interval | `w/s` | `wkB/s` | MiB/s | `wareq-sz` | `w_await` | `%util` |
+|---|---|---|---|---|---|---|
+| 2 | 3351.6 | 263,238 | **257** | 78.5 KB | 3.39 ms | 78.9 % |
+| 3 | 3378.6 | 268,622 | **262** | 79.5 KB | 2.23 ms | 77.0 % |
+| 4 | 2693.2 | 213,709 | 209 | 79.4 KB | 9.21 ms | 90.0 % |
+| 5 | 2144.2 | 170,238 | 166 | 79.4 KB | 16.95 ms | 94.5 % |
+| 7 | 1847.4 | 141,210 | 138 | 76.4 KB | 12.79 ms | 93.1 % |
+| 8 | 931.4 | 62,140 | **61** | 66.7 KB | 27.21 ms | 96.5 % |
+| 15 | 1038.8 | 64,120 | **63** | 61.7 KB | 6.98 ms | 93.0 % |
+
+Peak **262 MiB/s**, decaying to **60–80 MiB/s** and staying there.
+
+The FC ceiling is ~380 MB/s. The write path never came near it.
+
+One interval caught the read side, once the destination file began
+being read back:
+
+```text
+r/s 3775.80   rkB/s 296310 (289 MiB/s)   r_await 0.07 ms   rareq-sz 78.5 KB
+```
+
+**70 microseconds.** That is the RAM cache behaving exactly as
+designed — and 289 MiB/s is close enough to the link ceiling to be
+constrained by it.
+
+## Finding 1 — read-modify-write, finally visible
+
+The write signature is unambiguous once the four numbers are read
+together:
+
+| Observation | Value |
+|---|---|
+| average write size (`wareq-sz`) | **79 KB** |
+| RAID 6 full stripe (6 data × 64 KB) | **384 KB** |
+| device utilisation (`%util`) | **92–97 %** |
+| throughput delivered at that utilisation | **60–80 MiB/s** |
+| latency (`w_await`) over the run | **3.4 ms → 27 ms** |
+
+A 79 KB write is roughly a fifth of a stripe. RAID 6 cannot place it
+directly: the controller must read the old data, the old P parity and
+the old Q parity, recompute both, and write everything back. One
+logical write becomes on the order of six physical operations. That is
+why the device sits at 96 % utilisation while delivering 60 MB/s, and
+why latency climbs eightfold as the queue builds.
+
+**Where this was previously looked for, wrongly:** an earlier
+suggestion was to watch reads on `sdb` during a write test and infer
+RMW from them. That cannot work — RMW happens between the controller
+and the physical disks, *below* the virtual disk Linux sees. The
+kernel never observes those reads. It is visible only indirectly,
+through the ratio of `%util` to `wkB/s`, which is what this capture
+shows.
+
+## Finding 2 — under writethrough, the cache is not in the write path
+
+Write hit ratio was 91 % and dirty blocks 0. Both are consistent and
+neither helps: under writethrough **every write must reach the origin**
+whether it hits in cache or not. The cache updates its copy and the
+guest still waits for RAID 6.
+
+A high write hit ratio is therefore not a performance indicator in this
+mode. It only means the blocks being written were already resident.
+
+## Finding 3 — cache churn during a sequential write, quantified
+
+```text
+Cache usage        : 100.0%
+Promotion rate     : 337 blocks
+Demotions          : 337
+Full cache turnover: 32.1 min
+```
+
+Promotions and demotions are **identical**. The cache is full, so every
+new block admitted evicts an existing one. During a 10 GB sequential
+copy that is pure loss: the copied blocks will never be read a second
+time, and they are displacing blocks that would have been.
+
+This is the first *measured* instance of the case `migration_threshold`
+was introduced for. Field Test #5 showed the same effect from a
+synthetic prep write; this one arrived from ordinary administrative
+work.
+
+**It was not in effect during this test.** The installed binary was
+0.4.0-alpha; `migration_threshold` ships in 0.4.1-alpha and had not yet
+been deployed to the node. The measurement therefore stands as the
+"before" reading, with a repeat at 512 to follow.
+
+## Finding 4 — narrowing the 8 Gb upgrade case from Field Test #7
+
+Field Test #7 concluded that an 8 Gb fabric would roughly double
+throughput. That conclusion was drawn from sequential *read* profiles
+and was stated too broadly. This test separates the two directions:
+
+| Path | Measured today | Limited by | 8 Gb helps? |
+|---|---|---|---|
+| Read (cache hit) | 289 MiB/s, 0.07 ms | **the link** | **yes** |
+| Write | 262 MiB/s peak, 60–80 sustained | **RAID 6 RMW** | **no** |
+
+Doubling the link cannot help a path that never reached the current
+ceiling. Whether the upgrade is worth it therefore depends on the
+read/write ratio of the real workload — not on this test, which at 4222
+writes against 1 read is the least favourable case the FC argument
+could be given.
+
+**Pending:** `iostat -x 60` across a normal working day, to obtain that
+ratio before the purchase is proposed.
+
+## What this suggests about the write path
+
+The write bottleneck has a known shape and a known family of fixes:
+
+1. **Larger writes.** 79 KB against a 384 KB stripe is the root of it.
+   Nothing in this stack controls the guest's I/O size directly, but a
+   smaller stripe would reduce the mismatch — at the cost of rebuilding
+   the array.
+2. **`migration_threshold`.** Does not address RMW; it limits the
+   collateral damage to cache contents while RMW is happening.
+3. **An SSD cache in writeback.** This is the fix that actually
+   addresses the latency: the SSD would absorb 79 KB writes at its own
+   speed and destage to the array independently, instead of making the
+   guest wait for a parity cycle. Field Test #7 measured that
+   difference on the SSD tier itself — 366 MiB/s writeback against 57
+   writethrough.
+
+   **Blocked until warm assemble exists.** `create` currently zeroes
+   cache metadata on every assembly, so dirty blocks held on an SSD
+   would be lost across a reboot. Until the cache can be reattached
+   with its metadata intact, writeback on a persistent cache device is
+   data loss waiting for a power cut, not a performance feature.
+
+Note also that a *combined* RAM + SSD cache — raised as a possibility
+before this test — is not something dm-cache offers. One origin takes
+exactly one cache device. Stacking two dm-cache layers is possible in
+principle and doubles the assembly and recovery surface for no measured
+benefit.
+
+## Lessons
+
+1. **A progress dialog reports acceptance, not persistence.** 1.06 GB/s
+   was a true measurement of the wrong thing.
+2. **Define the falsifying observation before arguing.** "The counters
+   will not move" took ten seconds to check and ended the question.
+   The XCOPY error in Field Test #7 came from reasoning where a
+   measurement was available.
+3. **A bottleneck is invisible in the place you expect it.** RMW does
+   not appear as reads on the virtual disk. It appears as high `%util`
+   with low throughput.
+4. **Narrowing an earlier conclusion is part of the work.** Field Test
+   #7's upgrade case was not wrong so much as unqualified. The cost of
+   leaving it unqualified would have been ~400 EUR spent against the
+   wrong wall.
+
+---
+
+# Field Test #9 — A working day, measured layer by layer
+
+Date: 2026-08-17 (capture ~10:40–16:00, 321 intervals of 60 s = 5.35 h)
+
+`iostat -x 60` left running across a normal Monday, with **no device
+filter** — so every layer was captured at once: what LIO exports, what
+the RAM cache serves, what the array actually does, and the second
+(uncached) LUN.
+
+The intent was narrow: obtain the read/write ratio needed to decide the
+8 Gb fabric upgrade. It also produced the first end-to-end latency
+decomposition of the stack, and caught a methodological error that had
+already distorted the previous day's conclusions.
+
+## Device map, confirmed from the data
+
+| Device | What it is | Confirmed how |
+|---|---|---|
+| `dm-3` | `TestDiskCached` — what LIO exports | matches `--delta` counters to 0.3 % |
+| `dm-2` | dm-cache data device, on `brd` (RAM) | `dm-2` + `sdb` ≈ `dm-3` reads, at 0.010 ms |
+| `sdb` | the 48 TB RAID 6 array (origin) | |
+| `sdc` | SSD RAID 0, second LUN, **no cache** | HAProxy + nginx reverse proxy |
+
+`dm-2` had been assumed to be the cache data device in the morning's
+analysis. The day's figures confirm it: 7.71 MiB/s at **0.010 ms** from
+`dm-2`, 0.69 MiB/s at 12.9 ms from `sdb`, summing to slightly more than
+the 8.04 MiB/s `dm-3` delivered to the host. The excess is promotions —
+blocks read from the origin into the cache which never reach the
+initiator.
+
+## The read path, three layers, measured
+
+```text
+guest sees (dm-3)   8.04 MiB/s    r_await p50  0.08 ms
+   ├── cache hit    7.71 MiB/s    r_await      0.010 ms   ← RAM
+   └── array        0.69 MiB/s    r_await p50 12.77 ms    ← RAID 6
+```
+
+**160× at the median.** That single ratio is the clearest statement of
+what this tool does that the project has produced so far.
+
+A recurring pattern in the log makes it visible in isolation. Intervals
+187, 219, 224, 240, 246, 267 and 289 all show almost exactly the same
+figures:
+
+```text
+dm-3 read 37.1 MiB/s   sdb read 0.0   r_await 0.03 ms   %util 1.4–1.9 %
+```
+
+Some periodic job reading the same working set. It is served entirely
+from RAM at 30 µs, and the array does not notice it happened.
+
+## Totals for the day
+
+| | `dm-3` | `sdc` | total |
+|---|---|---|---|
+| Read | **158.6 GB** | 3.9 GB | **162.5 GB** |
+| Written | 4.5 GB | ~0 | 4.5 GB |
+| Served from the array | 13.7 GB (**8.6 %**) | — | |
+
+**91.4 % of read bytes came from cache.** The read:write ratio by volume
+is **35 : 1**.
+
+Per-interval distribution on `dm-3`:
+
+| | avg | p50 | p95 | max |
+|---|---|---|---|---|
+| read MiB/s | 8.04 | 0.01 | 37.12 | **74.76** |
+| write MiB/s | 0.23 | 0.08 | 0.23 | 14.69 |
+| read IOPS | 116 | 2 | 482 | 1938 |
+| write IOPS | 15.7 | 11.9 | 26.2 | 208 |
+| `r_await` ms | 0.47 | **0.08** | 2.17 | 7.30 |
+| `%util` | 2.4 | 0.3 | 7.2 | 98.7 |
+
+`%util` exceeded 50 % in **6 of 321 intervals — 1.9 % of the day**.
+
+## Finding 1 — the fabric is not the daytime constraint
+
+Peak minute across **both** LUNs together: **75.5 MiB/s**, of which the
+SSD LUN contributed 0.7. A 4 Gb link carries roughly 380 MB/s per
+direction.
+
+```text
+peak read  75.5 MiB/s  =  19.9 % of the link
+peak write 14.7 MiB/s  =   3.9 % of the link (opposite direction)
+```
+
+Directions are counted separately: Fibre Channel is full duplex, and
+summing them against one budget is the error made in Field Test #7.
+
+At 60-second granularity, across a full working day, the link never
+exceeded a fifth of its capacity. **The proposed ~400 EUR upgrade —
+16 × 8 Gb SFP plus 2 × QLE2560 — is not supported by daytime traffic.**
+
+This narrows Field Test #8, Finding 4 further. That test separated reads
+(link-bound) from writes (RAID-bound). This one shows that under real
+production load, neither direction approaches the link at all.
+
+## Finding 2 — the cumulative counters were measuring us
+
+The morning's `yellowstone status` reported, over 3.82 days of uptime:
+
+```text
+Write IOPS ≈ 1006/s      write hit ratio 3.92 %
+Read  IOPS ≈ 153/s       read  hit ratio 72.4 %
+```
+
+The working day measured **15.7 write IOPS** — a factor of **64** lower.
+
+The explanation is uncomfortable: those counters were dominated by **our
+own benchmarking**. Field Test #5 Part 2 on 15.08, Field Test #8 on
+16.08, and the fio runs around them all wrote into the same cumulative
+registers. An analysis was then built on top of them — including a claim
+that the workload is "latency-bound on writes, 1006 small writes per
+second" — which described the test harness, not the users.
+
+Field Test #3 already documented this exact failure and stated the rule:
+*"cumulative counters after several days do not describe any real
+state."* The rule was written, published, and then walked into again
+three weeks later in the same project. `status --delta` exists precisely
+because of it, and was not used for the sizing question.
+
+**Practical consequence:** any figure quoted for capacity planning must
+come from `--delta` or from an interval capture, and must state the
+window it covers. A cumulative counter is a lifetime total on a machine
+that has been used for experiments — it is a history of the operator, not
+of the workload.
+
+## Finding 3 — the placement of the second LUN is correct
+
+`sdc` carried 3.9 GB of reads in 5.35 hours — 2.4 % of total traffic.
+That is not underuse; a reverse proxy pair is network-bound and touches
+disk only for configuration and logs.
+
+The pair also sits on **RAID 0, deliberately**. HAProxy and nginx are the
+two most easily rebuilt services in the estate: losing that array costs
+configuration, not data. Stateless services on the array without
+redundancy, stateful ones on RAID 6 — worth recording because it was a
+choice, not an accident.
+
+## The replication window — measured the following night
+
+The capture was left running and eventually covered **23.33 hours
+(1400 intervals)**, including the full replication window. What follows
+replaces the "not measured" section that stood here originally.
+
+### The window
+
+One clear block stands out: **intervals 511–790, 280 minutes ≈ 4 h 40 m**,
+roughly 18:15–22:55. Yellowstone is quiet before and after; the job moves
+on to the other datastores, and the complete cycle across the estate takes
+about 1.5 days.
+
+| | |
+|---|---|
+| Read through LIO | **273.3 GB** |
+| Of which from the array | 173.2 GB (63 %) |
+| Average rate | **16.1 MiB/s** |
+| **Peak minute** | **113.9 MiB/s** |
+| `sdb %util` average | **2.2 %** |
+| `sdb %util` maximum | 31.6 % |
+
+Whole-capture extremes across **both** LUNs together:
+
+```text
+peak read  113.9 MiB/s = 30.0 % of the 4 Gb link
+peak write  28.2 MiB/s =  7.4 % (opposite direction)
+```
+
+### Why the peak is exactly what it is
+
+The 48 TB datastore is shared by all three ESXi hosts. Each host backs up
+its own VMs **sequentially**, but all three read from the same datastore
+**concurrently**:
+
+```text
+39.8 MB/s per stream × 3 hosts = 119 MB/s
+measured peak                  = 113.9 MiB/s
+```
+
+That is the operator's description of the schedule and the log agreeing to
+within a few percent, from two independent directions.
+
+### Finding 1 revised — the fabric case is closed, not narrowed
+
+Earlier in this document the daytime measurement was said to close only
+the user-traffic question, leaving the backup window open as the last case
+for 8 Gb. It is now measured, and it does not support the upgrade either:
+**30 % of the link at its single busiest minute**, during the full
+replication of every VM in the estate.
+
+Nor is the array a constraint: 2.2 % average utilisation while it happens.
+
+The **~400 EUR fabric upgrade is not justified by any workload this
+installation runs.** No further measurement is pending on that question.
+
+### Finding 4 — the target is the constraint, measured directly
+
+A controlled A/B was run afterwards. **Both runs were ordinary full hot
+replicas** — plain `--replica`, no CBT involved — so the only variable
+between them was the **destination**. (The target folder happens to be
+named `test-cbt`; that is a name, not a mode.)
+
+| | → Yellowstone 48T | → QNAP 116TB |
+|---|---|---|
+| Elapsed | **365 s** | 468 s |
+| Full file speed | **140.28 MB/s** | 109.40 MB/s |
+| Real data speed | **81.47 MB/s** | 57.60 MB/s |
+
+**Yellowstone is 28 % faster as a backup target** — 41 % on real data.
+
+The comparison is unusually clean, because the two arrays differ in fewer
+ways than one would expect:
+
+| | Yellowstone 48T | QNAP TS-883XU-RP 116TB |
+|---|---|---|
+| Spindles | **same count (8)** | **same count (8)** |
+| Source VM, host, HBA | identical | identical |
+| Fabric | 4 Gb FC | 4 Gb FC |
+| System RAM | **64 GB ECC** | **8 GB ECC** |
+| Cache in front | 16 GB of that RAM | 2 × 512 GB NVMe |
+| Cache mode | writethrough | **read-only** |
+| Controller write cache | 512 MB, **BBU-backed** | none |
+| CPU | Xeon X5650 era | Xeon E-2124, 4c @ 3.3 GHz |
+| VMs hosted on it | **more** | fewer |
+
+So the difference is not the disks, not the link, and not the production
+load — Yellowstone carried *more* running VMs while winning. It is the
+storage stack above the platters.
+
+Three candidate explanations, in order of likely weight:
+
+1. **Memory.** 8 GB on the QNAP has to serve QTS, every running service,
+   pool metadata for 116 TB *and* write buffering. Yellowstone dedicates
+   twice the QNAP's entire system memory to cache alone.
+2. **The NVMe cache contributes nothing to this workload.** It is
+   read-only; a backup target is a write workload. Two NVMe devices sit
+   idle while the platters take everything.
+3. **Yellowstone has a battery-backed writeback cache on the controller.**
+   The H700 acknowledges a write once it reaches its own 512 MB, so the
+   host does not wait for platters. Without BBU protection a NAS has to
+   be more conservative about acknowledging.
+
+**A fourth explanation was considered and discarded:** that the QNAP
+computes RAID 6 parity in software while the H700 has a dedicated XOR
+engine. The TS-883XU-RP runs an **Intel Xeon E-2124, 4 cores at 3.3 GHz**,
+which generates RAID 6 syndromes at multiple GB/s. Parity is not the
+constraint, and the hypothesis was dropped once the CPU was looked up
+rather than assumed.
+
+**What would settle it:** the QNAP's CPU and memory utilisation during a
+replication run. Not yet measured, so not claimed.
+
+### What the array actually did while receiving
+
+The `iostat` capture was still running during the A/B, so the write side
+of the Yellowstone run is recorded minute by minute:
+
+| | `dm-3` (what LIO exports) | `sdb` (the array) |
+|---|---|---|
+| Writes/s | **22,118** | **2,067** |
+| Average write size | **3.9 KB** | **41.9 KB** |
+| Merged (`%wrqm`) | — | **90.7 %** |
+| `w_await` | 4.49 ms | 3.40 ms |
+| Queue depth | **99.2** | 0.9 |
+| `%util` | — | **31.6 %** |
+
+30.6 GB in seven minutes, peaking at 84.5 MiB/s.
+
+Three things follow:
+
+1. **XSIBackup issues ~4 KB writes.** The "1 MB block size" in its help
+   text is the comparison granularity, not the I/O size. Twenty-two
+   thousand small writes per second.
+2. **The block layer merges 90.7 % of them** — 22,118 requests become
+   2,067, a ratio of **10.7 : 1**. Without that, the array would face
+   22 k IOPS of 4 KB writes, which eight spindles cannot approach. This
+   is the same mechanism first seen in Field Test #9's daytime capture,
+   here in its most extreme form.
+3. **The array sat at 31 % utilisation.** Yellowstone absorbed 84.5 MiB/s
+   using a third of its capacity. It was never the constraint.
+
+Nor was anything else in the path: the source is an SSD datastore, the
+target had headroom, and the link ran at 22 %. With a queue depth of 99
+and 84.5 MiB/s coming out the other side, **the limit was XSIBackup
+itself** — which is the strongest argument for CBT in this document. CBT
+does not make the transfer faster; it removes most of the work.
+
+### Conclusion, stated carefully
+
+Yellowstone was faster in this test — 28 % on elapsed time, 41 % on real
+data — and it did so while running at 31 % utilisation and hosting more
+VMs than the target it beat.
+
+**But the QNAP was not competing on equal terms.** It has 8 GB of RAM
+serving the OS, all services, pool metadata for 116 TB and write
+buffering; its NVMe cache is read-only and therefore idle during a write
+workload; and it has no battery-backed controller cache to acknowledge
+writes early. A TS-883XU-RP with its memory expanded toward the supported
+64 GB, or with a read-write cache, might well reverse this result. That
+has not been tested and is not being claimed either way.
+
+What the measurement does establish is narrower and more useful:
+
+> Under identical conditions — same source VM, same host, same HBA, same
+> 4 Gb fabric, same spindle count — a **self-built cache layer on
+> 2010-era hardware performed comparably to, and in this instance better
+> than, a current commercial storage appliance.**
+
+That is the honest form of the claim. Not that the approach is superior,
+but that it **holds its own against a commercial product**, which for a
+tool assembled from `dm-cache`, `brd` and one edited field in a JSON file
+is the result worth recording.
+
+Two further consequences fall out of this:
+
+- **Parallelism will not help.** One stream alone reaches 140 MB/s; three
+  concurrent streams reach ~38 MB/s each, ~114 MB/s in total. The target
+  saturates around 110–140 MB/s regardless of how the work is divided.
+  Raising the concurrency setting would divide the same ceiling.
+- **Neither target comes close to the fabric.** 140 MB/s of 380 available,
+  in the most favourable single-stream case.
+
+### Finding 5 — the real inefficiency is that every cycle is a full one
+
+The backup software is XSIBackup-DC 1.5.1.5, licensed, running
+`--replica` without CBT. Every cycle therefore reads every block of every
+VM to determine what changed.
+
+The A/B test above makes the cost concrete: that VM's replica took **6 to
+8 minutes and read 50 GB**, to transfer a machine that had changed by
+perhaps a few hundred megabytes since the previous run. Multiplied across
+the estate, that is the 36-hour cycle.
+
+For scale, from this same capture: the 48 TB datastore received **4.5 GB
+of writes across a working day** and was **read 273 GB** by the backup.
+
+VMware's Changed Block Tracking removes the scan entirely — the hypervisor
+already knows which blocks moved. The vendor's own documentation describes
+CBT replicas as "almost instant from the second run".
+
+**It is available and licensed.** `--replica=cbt` was attempted and
+returned:
+
+```text
+Error code 151 | no matching CTK entry for disk: scsi0:0.fileName
+/!\ There aren't any CTK files (-1), run --enable-cbt first, ignoring CBT flag
+```
+
+That is not a licensing refusal — the feature is present. It requires
+`--enable-cbt`, which in turn requires the VM to be **powered off**: the
+`-ctk.vmdk` tracking map is created when the disk is opened, and a running
+VM already holds its disks open without it. Note also that the tool failed
+*safely*, falling back to a normal replica rather than aborting.
+
+One structural obstacle remains, and it is the operator's retention scheme
+rather than the software: each cycle writes to a **new** target folder
+(`backp410`, `backp411`, `backp412`, …, with per-host subfolders). A new
+folder is a new replication point with sequence zero, so CBT would have
+nothing to compare against and every run would still be full. Using three
+**fixed** target slots rotated in turn preserves the same three restore
+points of the same ages, while letting each slot keep its CBT sequence.
+
+Not yet acted on — recorded so the analysis is not lost.
+
+## What this test did NOT measure
+
+The backup window itself has been closed above. Three questions that were
+open when this section was first written have since been answered, and
+are recorded here so the sequence of reasoning stays visible:
+
+- **Where the backup writes to** — the QNAP (`116TB`), not the array being
+  read. Confirmed by the A/B test paths.
+- **Whether the fabric is the constraint** — no, at 30 % peak.
+- **Whether the backup pollutes the cache** — **yes, and now observed.**
+  During the window the array supplied **63 %** of the bytes read, against
+  8.6 % during the working day: the backup is reading precisely what the
+  cache does not hold, and admitting it. 273 GB passed through a 16 GB
+  cache in 280 minutes, none of it to be read a second time.
+
+  That is the case `migration_threshold` was added for in 0.4.1-alpha, seen
+  directly for the first time. It was **not in effect** — the node still
+  runs 0.4.0-alpha — so this is the "before" reading.
+
+**Still genuinely unmeasured:**
+
+- the effect of `migration_threshold` (0.4.2-alpha not yet deployed)
+- the effect of CBT (requires a maintenance window per VM)
+- whether any of this holds in a normal month — see below
+
+## Caveat on the whole test
+
+**This is mid-August.** The operator was on annual leave for part of the
+month and a good share of the building with him. There is every reason to
+think this is among the quietest working days of the year.
+
+No conclusion here should be treated as final until the same capture is
+repeated in September.
+
+## Actions
+
+- [x] Overnight capture across the backup window — done, 23.33 h total
+- [x] Establish where the backup writes its target — the QNAP
+- [x] Decide on the 8 Gb fabric — **no**, on measured grounds
+- [ ] Repeat the working-day capture on a normal September day
+- [ ] Deploy 0.4.2-alpha and re-measure with `migration_threshold`
+- [ ] Trial `--enable-cbt` + `--replica=cbt` on one expendable VM, in a
+      maintenance window (requires the VM powered off)
+- [ ] If CBT is adopted: convert the retention scheme from
+      "new folder each cycle" to three fixed rotating slots
+
+## Lessons
+
+1. **Run the capture unfiltered.** Naming a single device would have
+   produced the same throughput figures and none of the layer
+   decomposition — no `dm-2` confirmation, no 160×, no promotion
+   accounting.
+2. **A published rule is not an applied rule.** Field Test #3's warning
+   about cumulative counters was written by the same people who then
+   ignored it. Rules need to be built into the tool, not into the
+   documentation — which is what `--delta` was, and it still was not
+   reached for.
+3. **State the window, always.** "1006 write IOPS" and "15.7 write IOPS"
+   are both true of this machine. Neither means anything without the
+   period attached.
+4. **Measuring in the quiet season proves less than it appears to.** The
+   numbers are real; their representativeness is not established.
+
+---
+
 # Hardening checklist for the rebuild window
 
 Everything the earlier incidents recommended, collected in one place:
@@ -1076,3 +1744,13 @@ Everything the earlier incidents recommended, collected in one place:
   rebuild
 - **pending:** memtest86+ pass; kdump `crashkernel=` verified active
   after the next boot
+- **pending:** 0.4.1-alpha deployed to the node and `migration_threshold`
+  re-measured at 512 against the Field Test #8 baseline
+- **done:** working-day `iostat -x 60` capture — Field Test #9. Daytime
+  peak was 19.9 % of the 4 Gb link, so the ~400 EUR fabric upgrade is not
+  justified by user traffic
+- **pending:** overnight capture across the **backup window**, which
+  Field Test #9 did not cover — the last remaining case for 8 Gb, and the
+  prime suspect for cache pollution
+- **pending:** repeat the working-day capture in September; the August
+  measurement was taken in the quietest month of the year

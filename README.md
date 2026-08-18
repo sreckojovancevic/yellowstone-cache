@@ -115,6 +115,13 @@ Full raw data and interpretation: [docs/field-test.md](docs/field-test.md) ·
 Disaster recovery runbook: [docs/recovery.md](docs/recovery.md) ·
 Controller/drive findings: [docs/hardware-notes.md](docs/hardware-notes.md)
 
+Not yet built, not yet measured — a design note for a second cache tier
+(RAM over SSD), written in advance so the work starts from a plan and
+its predictions can be scored honestly:
+[docs/design-l2.md](docs/design-l2.md) ·
+wear baseline for the cache SSD, recorded before it entered service:
+[docs/l2-ssd-baseline.md](docs/l2-ssd-baseline.md)
+
 ## Features
 
 - `up NAME` / `down NAME` — attach/detach cache to a LIO backstore in
